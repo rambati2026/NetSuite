@@ -3,6 +3,8 @@
  *
  * @NApiVersion 2.1
  * @NScriptType Suitelet
+ * Ramakrishna Ambati
+ * Date : 05/09/2026
  */
 define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/url', 'N/format'], (
   serverWidget,

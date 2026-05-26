@@ -4,7 +4,8 @@
  * @NApiVersion 2.1
  * @NScriptType Suitelet
  * Ramakrishna Ambati
- * Date : 05/09/2026
+ * Date: 08/05/2026
+ * Integration log
  */
 define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/url', 'N/format'], (
   serverWidget,
@@ -34,16 +35,23 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       inactive: 'isinactive'
     },
 
-    pageSize: 300,
     drilldownPageSize: 100,
     searchPageSize: 1000,
     queryLimit: 2000,
     defaultFromMonth: 2,
     defaultFromDay: 1,
     dashboardTitle: 'Order Response Integration Monitor',
+    developedBy: 'Ramakrishna Ambati',
+    version: '1.2.4',
     useSearchDateFilters: true,
     useSearchDetailColumns: false,
     enableRetry: true,
+    retrySuitelet: {
+      script: '1948',
+      deploy: '1',
+      companyId: '',
+      orderIdParam: 'ordID'
+    },
     retry: {
       flagFields: [
         'custrecord_xx1s_retry_requested',
@@ -76,6 +84,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       ]
     }
   };
+  const transactionInternalIdCache = {};
 
   function onRequest(context) {
     const request = context.request;
@@ -172,8 +181,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
 
     const searchStats = rows.searchStats || buildEmptySearchStats();
     const normalized = rows.map(row => normalizeRow(row, selectedRecordType));
-    const drilldownRows = buildLatestUniqueDrilldownRows(normalized);
-    const summary = buildSummary(normalized);
+    const viewRows = applyResultFilters(buildViewRows(normalized, filters.viewMode), filters);
+    const drilldownRows = buildViewDrilldownRows(viewRows, filters.viewMode);
+    const summary = buildSummary(viewRows);
     const previousPeriod = fetchPreviousPeriodSummary(filters, selectedRecordType);
     summary.comparison = buildSummaryComparison(summary, previousPeriod.summary, previousPeriod.filters);
 
@@ -183,14 +193,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       filters,
       searchStats,
       summary,
-      insights: buildInsights(normalized),
-      categoryBreakdown: buildCategoryBreakdown(normalized),
-      failureFingerprints: buildFailureFingerprints(normalized),
-      latestFailures: buildLatestFailures(normalized),
-      dailyTrend: buildDailyTrend(normalized, filters),
-      topVendors: buildTopVendors(normalized),
+      insights: buildInsights(viewRows),
+      categoryBreakdown: buildCategoryBreakdown(viewRows),
+      failureFingerprints: buildFailureFingerprints(viewRows),
+      latestFailures: buildLatestFailures(viewRows),
+      dailyTrend: buildDailyTrend(viewRows, filters),
+      topVendors: buildTopVendors(viewRows),
       drilldownRows,
-      rows: normalized
+      rows: viewRows
     };
   }
 
@@ -372,10 +382,15 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return {
       dateFrom: isIsoDate(params.dateFrom) ? params.dateFrom : defaults.dateFrom,
       dateTo: isIsoDate(params.dateTo) ? params.dateTo : defaults.dateTo,
+      viewMode: normalizeViewMode(params.viewMode || params.mode),
       status: params.status || 'ALL',
       category: params.category || 'ALL',
       search: String(params.search || '').trim()
     };
+  }
+
+  function normalizeViewMode(value) {
+    return String(value || '').toUpperCase() === 'HISTORY' ? 'HISTORY' : 'CURRENT';
   }
 
   function getDefaultDateRange() {
@@ -396,46 +411,52 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
   function fetchRows(filters, recordType) {
     const fromDate = isoDateBoundary(filters.dateFrom, false);
     const toDate = isoDateBoundary(filters.dateTo, true);
-    let rows = fetchRowsFromSearch(recordType, fromDate, toDate);
+    const rows = fetchRowsFromSearch(recordType, fromDate, toDate);
     const searchStats = rows.searchStats || buildEmptySearchStats();
 
+    rows.searchStats = Object.assign({}, searchStats, {
+      matchedRows: rows.length,
+      returnedRows: rows.length
+    });
+
+    return rows;
+  }
+
+  function applyResultFilters(rows, filters) {
+    let filteredRows = (rows || []).slice();
+
     if (filters.status && filters.status !== 'ALL') {
-      rows = rows.filter(r => inferStatus(r.return_message) === filters.status);
+      filteredRows = filteredRows.filter(r => r.status === filters.status);
     }
 
     if (filters.category && filters.category !== 'ALL') {
-      rows = rows.filter(r => inferCategory(r.return_message) === filters.category);
+      filteredRows = filteredRows.filter(r => r.category === filters.category);
     }
 
     if (filters.search) {
-      const s = filters.search.toLowerCase();
-      rows = rows.filter(r => buildRowSearchText(r).indexOf(s) >= 0);
+      const s = String(filters.search || '').toLowerCase();
+      filteredRows = filteredRows.filter(r => buildNormalizedRowSearchText(r).indexOf(s) >= 0);
     }
 
-    const filteredCount = rows.length;
-    const limitedRows = rows.slice(0, CONFIG.pageSize);
-    limitedRows.searchStats = Object.assign({}, searchStats, {
-      matchedRows: filteredCount,
-      returnedRows: limitedRows.length,
-      pageSize: CONFIG.pageSize,
-      hitPageSize: filteredCount > CONFIG.pageSize
-    });
-
-    return limitedRows;
+    return filteredRows;
   }
 
-  function buildRowSearchText(row) {
+  function buildNormalizedRowSearchText(row) {
     return [
       row.id,
       row.name,
       row.owner,
       row.created,
-      row.transaction_type,
-      inferStatus(row.return_message),
-      inferCategory(row.return_message),
-      row.return_message,
-      row.sanmina_order_number,
-      row.purchase_order
+      row.transactionType,
+      row.status,
+      row.category,
+      row.severity,
+      row.priority,
+      row.failureFingerprint,
+      row.returnMessage,
+      row.sanminaOrderNumber,
+      row.purchaseOrderId,
+      row.purchaseOrder
     ].join(' ').toLowerCase();
   }
 
@@ -618,6 +639,10 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
 
     detailColumns.forEach(def => {
       values[def.key] = readFirstSearchColumnValue(result, def.columns);
+
+      if (def.key === 'purchase_order') {
+        values.purchase_order_id = readFirstSearchColumnRawValue(result, def.columns);
+      }
     });
 
     return values;
@@ -633,6 +658,22 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         // Some search columns do not expose text values.
       }
 
+      try {
+        const value = result.getValue(columns[i]);
+
+        if (value !== null && value !== undefined && value !== '') {
+          return String(value);
+        }
+      } catch (e) {
+        // Try the next configured field id.
+      }
+    }
+
+    return '';
+  }
+
+  function readFirstSearchColumnRawValue(result, columns) {
+    for (let i = 0; i < columns.length; i++) {
       try {
         const value = result.getValue(columns[i]);
 
@@ -665,7 +706,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         transaction_type: safeRecordValue(responseRecord, f.transactionType),
         return_message: safeRecordValue(responseRecord, f.returnMessage),
         sanmina_order_number: safeRecordValue(responseRecord, f.sanminaOrderNumber),
-        purchase_order: safeRecordValue(responseRecord, f.purchaseOrder)
+        purchase_order: safeRecordValue(responseRecord, f.purchaseOrder),
+        purchase_order_id: safeRecordRawValue(responseRecord, f.purchaseOrder)
       };
       const detectedValues = needsResponseAutoDetection(configuredValues) ?
         detectResponseRecordValues(responseRecord) :
@@ -676,7 +718,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         transaction_type: configuredValues.transaction_type || detectedValues.transaction_type,
         return_message: configuredValues.return_message || detectedValues.return_message,
         sanmina_order_number: configuredValues.sanmina_order_number || detectedValues.sanmina_order_number,
-        purchase_order: configuredValues.purchase_order || detectedValues.purchase_order
+        purchase_order: configuredValues.purchase_order || detectedValues.purchase_order,
+        purchase_order_id: configuredValues.purchase_order_id
       };
     } catch (e) {
       log.error({
@@ -690,7 +733,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       transaction_type: '',
       return_message: '',
       sanmina_order_number: '',
-      purchase_order: ''
+      purchase_order: '',
+      purchase_order_id: ''
     };
   }
 
@@ -707,7 +751,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       transaction_type: '',
       return_message: '',
       sanmina_order_number: '',
-      purchase_order: ''
+      purchase_order: '',
+      purchase_order_id: ''
     };
   }
 
@@ -838,6 +883,28 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  function safeRecordRawValue(responseRecord, fieldIds) {
+    const ids = Array.isArray(fieldIds) ? fieldIds : [fieldIds];
+
+    for (let i = 0; i < ids.length; i++) {
+      const fieldId = ids[i];
+
+      if (!fieldId) continue;
+
+      try {
+        const value = responseRecord.getValue({ fieldId });
+
+        if (value !== null && value !== undefined && value !== '') {
+          return String(value);
+        }
+      } catch (e) {
+        // Try the next configured field id.
+      }
+    }
+
+    return '';
+  }
+
   function isInvalidRecordTypeError(error) {
     const name = String(error && error.name ? error.name : '');
     const message = String(error && error.message ? error.message : error);
@@ -850,6 +917,10 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     const severity = inferSeverity(category, row.return_message, status);
     const priority = inferPriority(severity);
     const failureFingerprint = status === 'FAILED' ? buildFailureFingerprint(row.return_message, category) : '';
+    const purchaseOrderId = status === 'FAILED' ?
+      resolveRetryOrderInternalId(row) :
+      normalizeInternalId(row.purchase_order_id || row.purchase_order);
+    const retryUrl = status === 'FAILED' ? buildOrderRetryUrl(purchaseOrderId) : '';
 
     return {
       id: row.id,
@@ -868,6 +939,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       returnMessage: row.return_message || '',
       sanminaOrderNumber: row.sanmina_order_number || '',
       purchaseOrder: row.purchase_order || '',
+      purchaseOrderId,
+      retryUrl,
+      resolvedBySuccess: false,
       retryable: status === 'FAILED'
     };
   }
@@ -982,8 +1056,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     const previousFilters = buildPreviousPeriodFilters(filters);
 
     try {
-      const previousRows = fetchRows(previousFilters, recordType)
-        .map(row => normalizeRow(row, recordType));
+      const previousRows = applyResultFilters(
+        buildViewRows(fetchRows(previousFilters, recordType)
+          .map(row => normalizeRow(row, recordType)), previousFilters.viewMode),
+        previousFilters
+      );
 
       return {
         filters: previousFilters,
@@ -1049,10 +1126,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       scanned: 0,
       matchedRows: 0,
       returnedRows: 0,
-      pageSize: CONFIG.pageSize,
       queryLimit: CONFIG.queryLimit,
       hitQueryLimit: false,
-      hitPageSize: false,
       useDateFilters: !!CONFIG.useSearchDateFilters,
       includeDetailColumns: !!CONFIG.useSearchDetailColumns
     };
@@ -1105,6 +1180,88 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .sort(compareRowsNewestFirst);
   }
 
+  function buildViewRows(rows, viewMode) {
+    if (viewMode === 'HISTORY') return buildHistoryRows(rows);
+    return buildCurrentTransactionRows(rows);
+  }
+
+  function buildViewDrilldownRows(rows, viewMode) {
+    if (viewMode === 'HISTORY') return rows.slice().sort(compareRowsNewestFirst);
+    return buildLatestUniqueDrilldownRows(rows);
+  }
+
+  function buildHistoryRows(rows) {
+    const latestSuccessByTransaction = {};
+
+    (rows || []).forEach(row => {
+      if (row.status !== 'SUCCESS') return;
+
+      const key = buildCurrentTransactionKey(row);
+      const existing = latestSuccessByTransaction[key];
+
+      if (!existing || compareRowsNewestFirst(row, existing) < 0) {
+        latestSuccessByTransaction[key] = row;
+      }
+    });
+
+    return (rows || []).map(row => {
+      const key = buildCurrentTransactionKey(row);
+      const latestSuccess = latestSuccessByTransaction[key];
+      const resolvedBySuccess = row.status === 'FAILED' &&
+        latestSuccess &&
+        compareRowsNewestFirst(latestSuccess, row) < 0;
+
+      return Object.assign({}, row, {
+        resolvedBySuccess,
+        retryable: row.retryable && !resolvedBySuccess
+      });
+    }).sort(compareRowsNewestFirst);
+  }
+
+  function buildCurrentTransactionRows(rows) {
+    const map = {};
+
+    (rows || []).forEach(row => {
+      const key = buildCurrentTransactionKey(row);
+      const existing = map[key];
+
+      if (!existing || compareRowsNewestFirst(row, existing) < 0) {
+        map[key] = row;
+      }
+    });
+
+    return Object.keys(map)
+      .map(key => map[key])
+      .sort(compareRowsNewestFirst);
+  }
+
+  function buildCurrentTransactionKey(row) {
+    const candidates = [
+      row.purchaseOrder,
+      row.name,
+      row.transactionType,
+      row.sanminaOrderNumber
+    ];
+
+    for (let i = 0; i < candidates.length; i++) {
+      const orderKey = normalizeOrderReferenceKey(candidates[i]);
+
+      if (orderKey) return orderKey;
+    }
+
+    return normalizeMatchText(row.purchaseOrder || row.name || row.sanminaOrderNumber || row.transactionType || row.id);
+  }
+
+  function normalizeOrderReferenceKey(value) {
+    const text = String(value || '');
+    const match = text.match(/\b((?:to|po|so|wo)\s*#?\s*\d+)\b/i) ||
+      text.match(/#\s*((?:to|po|so|wo)\s*\d+)/i);
+
+    if (!match) return '';
+
+    return match[1].replace(/[^a-z0-9]/gi, '').toUpperCase();
+  }
+
   function buildDrilldownUniqueKey(row) {
     const transactionKey = row.purchaseOrder ||
       row.sanminaOrderNumber ||
@@ -1151,6 +1308,174 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))[0];
 
     return top || { name: 'None', count: 0 };
+  }
+
+  function buildOrderRetryUrl(orderId) {
+    const cleanOrderId = normalizeInternalId(orderId);
+    const retrySuitelet = CONFIG.retrySuitelet || {};
+
+    if (!cleanOrderId || !retrySuitelet.script || !retrySuitelet.deploy) return '';
+
+    const companyId = getRetryCompanyId(retrySuitelet);
+    const orderIdParam = retrySuitelet.orderIdParam || 'ordID';
+    const params = [
+      'script=' + encodeURIComponent(retrySuitelet.script),
+      'deploy=' + encodeURIComponent(retrySuitelet.deploy)
+    ];
+
+    if (companyId) {
+      params.push('compid=' + encodeURIComponent(companyId));
+    }
+
+    params.push(encodeURIComponent(orderIdParam) + '=' + encodeURIComponent(cleanOrderId));
+
+    return '/app/site/hosting/scriptlet.nl?' + params.join('&');
+  }
+
+  function getRetryCompanyId(retrySuitelet) {
+    if (retrySuitelet && retrySuitelet.companyId) {
+      return String(retrySuitelet.companyId);
+    }
+
+    try {
+      return runtime.accountId ? String(runtime.accountId) : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function normalizeInternalId(value) {
+    const text = String(value || '').trim();
+    return /^\d+$/.test(text) ? text : '';
+  }
+
+  function resolveRetryOrderInternalId(row) {
+    const directId = normalizeInternalId(row.purchase_order_id || row.purchase_order);
+
+    if (directId) return directId;
+
+    const candidates = [
+      row.purchase_order,
+      row.name,
+      row.transaction_type,
+      row.sanmina_order_number
+    ];
+
+    for (let i = 0; i < candidates.length; i++) {
+      const transactionId = findTransactionInternalId(candidates[i]);
+
+      if (transactionId) return transactionId;
+    }
+
+    return '';
+  }
+
+  function findTransactionInternalId(value) {
+    const reference = parseTransactionReference(value);
+
+    if (!reference) return '';
+
+    const cacheKey = reference.prefix + ':' + reference.tranId;
+
+    if (Object.prototype.hasOwnProperty.call(transactionInternalIdCache, cacheKey)) {
+      return transactionInternalIdCache[cacheKey];
+    }
+
+    const searchTypes = getTransactionSearchTypes(reference.prefix);
+    let internalId = '';
+
+    for (let i = 0; i < searchTypes.length; i++) {
+      internalId = findTransactionInternalIdBySearchType(searchTypes[i], reference.tranId);
+
+      if (internalId) break;
+    }
+
+    transactionInternalIdCache[cacheKey] = internalId;
+    return internalId;
+  }
+
+  function parseTransactionReference(value) {
+    const text = String(value || '');
+    const match = text.match(/#\s*((?:to|po|so|wo)\s*#?\s*\d+)/i) ||
+      text.match(/\b((?:to|po|so|wo)\s*#?\s*\d+)\b/i);
+
+    if (!match) return null;
+
+    const tranId = match[1].replace(/[^a-z0-9]/gi, '').toUpperCase();
+    const prefix = tranId.substring(0, 2);
+
+    if (!/^(TO|PO|SO|WO)\d+$/i.test(tranId)) return null;
+
+    return {
+      prefix,
+      tranId
+    };
+  }
+
+  function getTransactionSearchTypes(prefix) {
+    const transactionSearchType = getSearchTypeValue('TRANSACTION', 'transaction');
+    const typesByPrefix = {
+      TO: getSearchTypeValue('TRANSFER_ORDER', 'transferorder'),
+      PO: getSearchTypeValue('PURCHASE_ORDER', 'purchaseorder'),
+      SO: getSearchTypeValue('SALES_ORDER', 'salesorder'),
+      WO: getSearchTypeValue('WORK_ORDER', 'workorder')
+    };
+    const specificType = typesByPrefix[prefix];
+
+    return specificType && specificType !== transactionSearchType ?
+      [specificType, transactionSearchType] :
+      [transactionSearchType];
+  }
+
+  function getSearchTypeValue(enumName, fallback) {
+    try {
+      return search.Type && search.Type[enumName] ? search.Type[enumName] : fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function findTransactionInternalIdBySearchType(searchType, tranId) {
+    const attempts = [true, false];
+
+    for (let i = 0; i < attempts.length; i++) {
+      const internalId = runTransactionInternalIdLookup(searchType, tranId, attempts[i]);
+
+      if (internalId) return internalId;
+    }
+
+    return '';
+  }
+
+  function runTransactionInternalIdLookup(searchType, tranId, useMainlineFilter) {
+    const colInternalId = search.createColumn({ name: 'internalid' });
+    const filters = [['tranid', 'is', tranId]];
+
+    if (useMainlineFilter) {
+      filters.push('AND', ['mainline', 'is', 'T']);
+    }
+
+    try {
+      const results = search.create({
+        type: searchType,
+        filters,
+        columns: [colInternalId]
+      }).run().getRange({
+        start: 0,
+        end: 1
+      });
+
+      if (results && results.length) {
+        return normalizeInternalId(results[0].getValue(colInternalId));
+      }
+    } catch (e) {
+      log.error({
+        title: 'Retry transaction lookup failed for ' + tranId + ' using ' + searchType,
+        details: e
+      });
+    }
+
+    return '';
   }
 
   function countFailuresSince(rows, sinceDate) {
@@ -1459,6 +1784,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     const filters = data.filters || getDefaultDateRange();
     const rows = data.rows || [];
     const drilldownRows = data.drilldownRows || rows;
+    const viewModeLabel = getViewModeLabel(filters.viewMode);
 
     return `
 ${buildCss()}
@@ -1466,14 +1792,21 @@ ${buildCss()}
   <div class="dash-topbar">
     <div>
       <h1>${esc(CONFIG.dashboardTitle)}</h1>
-      <div class="dash-sub">Selected range: ${esc(filters.dateFrom)} to ${esc(filters.dateTo)} · ${esc(getTrendGroupingLabel(filters))}</div>
+      <div class="dash-sub">${esc(viewModeLabel)} · Selected range: ${esc(filters.dateFrom)} to ${esc(filters.dateTo)} · ${esc(getTrendGroupingLabel(filters))}</div>
     </div>
     <div class="dash-topbar-right">
       <div id="lastRefreshed" class="dash-refresh" data-generated-at="${escAttr(data.generatedAt || '')}">${esc(formatLastRefreshedText(data.generatedAt))}</div>
       <div class="dash-actions">
         <button type="button" class="btn btn-primary" onclick="applyFilters(true)">Refresh</button>
         <button type="button" class="btn" onclick="resetDefaultRange()">Default Range</button>
+        <button type="button" id="autoRefreshToggle" class="btn" onclick="toggleAutoRefresh()">Auto Refresh Off</button>
+        <select id="autoRefreshInterval" class="auto-refresh-select" onchange="setAutoRefreshInterval(this.value)" aria-label="Auto refresh interval">
+          <option value="60">1 min</option>
+          <option value="300">5 min</option>
+          <option value="900">15 min</option>
+        </select>
       </div>
+      <div id="autoRefreshStatus" class="auto-refresh-status">Auto refresh off</div>
     </div>
   </div>
 
@@ -1497,7 +1830,7 @@ ${buildCss()}
       ${buildTrendExtremesHtml(data.dailyTrend || [])}
     </section>
 
-    <section class="panel">
+    <section class="panel activity-panel">
       <div class="panel-head">
         <div>
           <h2>Error Categories</h2>
@@ -1509,7 +1842,7 @@ ${buildCss()}
   </div>
 
   <div class="analysis-grid lower">
-    <section class="panel">
+    <section class="panel activity-panel">
       <div class="panel-head">
         <div>
           <h2>Top PO / TO Activity</h2>
@@ -1519,7 +1852,7 @@ ${buildCss()}
       ${buildTopActivityBars(data.topVendors || [])}
     </section>
 
-    <section class="panel">
+    <section class="panel mix-panel">
       <div class="panel-head">
         <div>
           <h2>Failure Mix</h2>
@@ -1534,11 +1867,16 @@ ${buildCss()}
     <div class="panel-head">
       <div>
         <h2>Transaction Drilldown</h2>
-        <span id="drilldownCount">${esc(buildDrilldownCountText(drilldownRows.length))}</span>
+        <span id="drilldownCount">${esc(buildDrilldownCountText(drilldownRows.length, filters))}</span>
       </div>
     </div>
-    ${buildTableHtml(drilldownRows)}
+    ${buildTableHtml(drilldownRows, filters)}
   </section>
+
+  <div class="dash-footer">
+    <span>Developed by ${esc(CONFIG.developedBy)}</span>
+    <span class="version-badge">v${esc(CONFIG.version)}</span>
+  </div>
 </div>
 
 ${buildMessageModalHtml()}
@@ -1603,6 +1941,14 @@ ${buildScript(suiteletUrl, filters)}
     return String(Number(value || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
+  function getViewModeLabel(viewMode) {
+    return viewMode === 'HISTORY' ? 'History view' : 'Current status view';
+  }
+
+  function getDrilldownRecordLabel(filters) {
+    return filters && filters.viewMode === 'HISTORY' ? 'response record(s)' : 'current transaction record(s)';
+  }
+
   function buildInsightsHtml(insights) {
     const cards = [
       {
@@ -1659,6 +2005,8 @@ ${buildScript(suiteletUrl, filters)}
   <label>Record Type
     <input id="recordType" type="text" value="" placeholder="customrecord_...">
   </label>`;
+    const currentActive = filters.viewMode !== 'HISTORY';
+    const historyActive = filters.viewMode === 'HISTORY';
 
     return `
 <div class="preset-row" aria-label="Date presets">
@@ -1670,6 +2018,13 @@ ${buildScript(suiteletUrl, filters)}
 </div>
 <div class="filters">
   ${recordTypeInputHtml}
+  <label>View
+    <input id="viewMode" type="hidden" value="${escAttr(filters.viewMode || 'CURRENT')}">
+    <span class="mode-toggle" role="group" aria-label="Dashboard view mode">
+      <button type="button" class="mode-btn${currentActive ? ' active' : ''}" onclick="setViewMode('CURRENT')">Current</button>
+      <button type="button" class="mode-btn${historyActive ? ' active' : ''}" onclick="setViewMode('HISTORY')">History</button>
+    </span>
+  </label>
   <label>From
     <input id="dateFrom" type="date" value="${escAttr(filters.dateFrom)}">
   </label>
@@ -1830,9 +2185,19 @@ ${buildScript(suiteletUrl, filters)}
     }).join('');
 
     return `
-<div class="chart-wrap">
+<div class="chart-wrap trend-chart-wrap">
   <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Error success trend">
     <defs>
+      <linearGradient id="trendBackgroundGradient" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#e0f7ff"></stop>
+        <stop offset="42%" stop-color="#f6fbff"></stop>
+        <stop offset="100%" stop-color="#ffffff"></stop>
+      </linearGradient>
+      <linearGradient id="trendWaveGradient" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#bae6fd" stop-opacity=".82"></stop>
+        <stop offset="48%" stop-color="#a7f3d0" stop-opacity=".44"></stop>
+        <stop offset="100%" stop-color="#dbeafe" stop-opacity=".74"></stop>
+      </linearGradient>
       <linearGradient id="trendSuccessGradient" x1="0" y1="1" x2="0" y2="0">
         <stop offset="0%" stop-color="#14b8a6"></stop>
         <stop offset="100%" stop-color="#5eead4"></stop>
@@ -1846,6 +2211,8 @@ ${buildScript(suiteletUrl, filters)}
         <stop offset="100%" stop-color="#cbd5e1"></stop>
       </linearGradient>
     </defs>
+    <rect x="0" y="0" width="${width}" height="${height}" rx="16" class="trend-chart-bg"></rect>
+    <path d="M 0 246 C 130 232 238 268 372 250 C 522 230 642 214 900 232 L 900 330 L 0 330 Z" class="trend-chart-wave"></path>
     ${grid}
     ${bars}
     <line x1="${left}" y1="${top + plotHeight}" x2="${width - right}" y2="${top + plotHeight}" class="axis-line"></line>
@@ -1880,20 +2247,30 @@ ${buildScript(suiteletUrl, filters)}
       }
     ];
 
+    const gaugeCards = gauges.map(gauge => {
+      return {
+        gauge,
+        min: getTrendExtreme(trend, gauge.metric, 'min'),
+        max: getTrendExtreme(trend, gauge.metric, 'max')
+      };
+    });
+    const scaleMax = getTrendGaugeScaleMax(gaugeCards);
+
     return `
 <div class="trend-gauge-grid">
-  ${gauges.map(gauge => buildTrendGaugeCard(trend, gauge)).join('')}
+  ${gaugeCards.map(gaugeCard => buildTrendGaugeCard(gaugeCard, scaleMax)).join('')}
 </div>`;
   }
 
-  function buildTrendGaugeCard(trend, gauge) {
-    const min = getTrendExtreme(trend, gauge.metric, 'min');
-    const max = getTrendExtreme(trend, gauge.metric, 'max');
+  function buildTrendGaugeCard(gaugeCard, scaleMax) {
+    const gauge = gaugeCard.gauge;
+    const min = gaugeCard.min;
+    const max = gaugeCard.max;
     const value = Number(max.value || 0);
 
     return `
 <div class="trend-gauge-card ${escAttr(gauge.key)}" title="${escAttr(max.title)}">
-  ${buildTrendGaugeSvg(gauge, value, Number(min.value || 0), Number(max.value || 0))}
+  ${buildTrendGaugeSvg(gauge, value, scaleMax)}
   <div class="trend-gauge-value">${esc(value)}</div>
   <div class="trend-gauge-label">${esc(gauge.label)}</div>
   <div class="trend-gauge-stats">
@@ -1909,13 +2286,17 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
-  function buildTrendGaugeSvg(gauge, value, minValue, maxValue) {
+  function getTrendGaugeScaleMax(gaugeCards) {
+    return Math.max.apply(null, (gaugeCards || []).map(gaugeCard => Number(gaugeCard.max.value || 0)).concat([0]));
+  }
+
+  function buildTrendGaugeSvg(gauge, value, scaleMax) {
     const width = 280;
     const height = 150;
     const cx = 140;
     const cy = 122;
     const radius = 86;
-    const percent = getGaugePercent(value, minValue, maxValue);
+    const percent = getGaugeNeedlePercent(getGaugePercent(value, scaleMax));
     const needleTip = getGaugePoint(cx, cy, radius - 6, percent);
     const needleBaseLeft = getGaugeNeedleBase(cx, cy, percent, -5);
     const needleBaseRight = getGaugeNeedleBase(cx, cy, percent, 5);
@@ -1937,10 +2318,13 @@ ${buildScript(suiteletUrl, filters)}
 </svg>`;
   }
 
-  function getGaugePercent(value, minValue, maxValue) {
-    if (!maxValue) return 0;
-    if (maxValue === minValue) return 1;
-    return Math.max(0, Math.min(1, (Number(value || 0) - minValue) / (maxValue - minValue)));
+  function getGaugePercent(value, scaleMax) {
+    if (!scaleMax) return 0;
+    return Math.max(0, Math.min(1, Number(value || 0) / scaleMax));
+  }
+
+  function getGaugeNeedlePercent(percent) {
+    return 0.08 + (Math.max(0, Math.min(1, Number(percent || 0))) * 0.84);
   }
 
   function getGaugePoint(cx, cy, radius, percent) {
@@ -2182,7 +2566,21 @@ ${buildScript(suiteletUrl, filters)}
     return `
 <div class="activity-circle-wrap">
   <svg class="activity-circle-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Top PO TO activity distribution">
-    <defs>${gradients}</defs>
+    <defs>
+      <linearGradient id="activityPanelGradient" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#e0f7ff"></stop>
+        <stop offset="52%" stop-color="#f0fdf4"></stop>
+        <stop offset="100%" stop-color="#fff7ed"></stop>
+      </linearGradient>
+      <linearGradient id="activityWaveGradient" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#38bdf8" stop-opacity=".18"></stop>
+        <stop offset="50%" stop-color="#14b8a6" stop-opacity=".14"></stop>
+        <stop offset="100%" stop-color="#f59e0b" stop-opacity=".18"></stop>
+      </linearGradient>
+      ${gradients}
+    </defs>
+    <rect x="0" y="0" width="${width}" height="${height}" rx="18" class="activity-chart-bg"></rect>
+    <path d="M 0 270 C 100 250 174 288 270 264 C 356 242 426 250 500 232 L 500 360 L 0 360 Z" class="activity-chart-wave"></path>
     <circle cx="${cx}" cy="${cy}" r="${outerRadius + 13}" class="activity-orbit"></circle>
     ${slices}
     <circle cx="${cx}" cy="${cy}" r="${innerRadius - 8}" class="activity-circle-center"></circle>
@@ -2239,82 +2637,115 @@ ${buildScript(suiteletUrl, filters)}
     const successPct = total ? Math.round((success / safeTotal) * 1000) / 10 : 0;
     const failedPct = total ? Math.round((failed / safeTotal) * 1000) / 10 : 0;
     const unknownPct = total ? Math.round((unknown / safeTotal) * 1000) / 10 : 0;
-    const failureRate = total ? formatRateValue((failed / safeTotal) * 100) : '0';
-    const rings = [
-      { className: 'failed', label: 'Failed', value: failed, pct: failedPct, radius: 82 },
-      { className: 'success', label: 'Success', value: success, pct: successPct, radius: 62 },
-      { className: 'unknown', label: 'Unknown', value: unknown, pct: unknownPct, radius: 42 }
+    const segments = [
+      buildStatusMixSegment('success', 'SUCCESS', 'Success', success, successPct, 286, 148),
+      buildStatusMixSegment('failed', 'FAILED', 'Failed', failed, failedPct, 176, 158),
+      buildStatusMixSegment('unknown', 'UNKNOWN', 'Unknown', unknown, unknownPct, 226, 238)
     ];
+    const outerCircles = segments.map(segment => `
+      <circle class="mix-venn-outer ${escAttr(segment.className)}${segment.inactive ? ' inactive' : ''}" cx="${segment.x}" cy="${segment.y}" r="${segment.outerRadius}">
+        <title>${esc(segment.label)}: ${esc(segment.value)} (${esc(formatRateValue(segment.pct))}%)</title>
+      </circle>`).join('');
+    const innerCircles = segments.slice().sort((a, b) => b.innerRadius - a.innerRadius).map(segment => {
+      const statusClass = segment.inactive ? ' inactive' : '';
+      const compactClass = segment.innerRadius < 56 ? ' compact' : '';
+
+      return `
+      <g class="mix-venn-bubble ${escAttr(segment.className)}${statusClass}${compactClass}" onclick="applyStatusFilter(${jsString(segment.status)})">
+        <circle class="mix-venn-inner ${escAttr(segment.className)}" cx="${segment.x}" cy="${segment.y}" r="${segment.innerRadius}"></circle>
+        <text x="${segment.x}" y="${segment.labelY}" text-anchor="middle" class="mix-venn-label">${esc(segment.label.toUpperCase())}</text>
+        <text x="${segment.x}" y="${segment.valueY}" text-anchor="middle" class="mix-venn-value">${esc(segment.value)}</text>
+        <text x="${segment.x}" y="${segment.pctY}" text-anchor="middle" class="mix-venn-pct">${esc(formatRateValue(segment.pct))}%</text>
+      </g>`;
+    }).join('');
 
     return `
 <div class="mix-card">
-  <div class="mix-radial-wrap">
-    <svg class="mix-radial-svg" viewBox="0 0 220 220" role="img" aria-label="Failure mix radial chart">
+  <div class="mix-venn-shell">
+    <svg class="mix-venn-svg" viewBox="0 0 466 326" role="img" aria-label="Failure mix overlapping status circles">
       <defs>
-        <linearGradient id="mixFailedGradient" x1="40" y1="180" x2="180" y2="40" gradientUnits="userSpaceOnUse">
-          <stop offset="0%" stop-color="#f97316"></stop>
-          <stop offset="100%" stop-color="#fb923c"></stop>
-        </linearGradient>
-        <linearGradient id="mixSuccessGradient" x1="40" y1="180" x2="180" y2="40" gradientUnits="userSpaceOnUse">
-          <stop offset="0%" stop-color="#0f9f8e"></stop>
-          <stop offset="100%" stop-color="#5eead4"></stop>
-        </linearGradient>
-        <linearGradient id="mixUnknownGradient" x1="40" y1="180" x2="180" y2="40" gradientUnits="userSpaceOnUse">
-          <stop offset="0%" stop-color="#94a3b8"></stop>
-          <stop offset="100%" stop-color="#cbd5e1"></stop>
+        <linearGradient id="mixVennBackgroundGradient" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#f8fcff"></stop>
+          <stop offset="46%" stop-color="#ecfeff"></stop>
+          <stop offset="100%" stop-color="#fff7ed"></stop>
         </linearGradient>
       </defs>
-      ${rings.map(ring => buildStatusMixRing(ring)).join('')}
+      <rect x="1" y="1" width="464" height="324" rx="12" class="mix-venn-bg"></rect>
+      <g class="mix-total-badge">
+        <rect x="326" y="20" width="118" height="42" rx="10"></rect>
+        <text x="385" y="38" text-anchor="middle" class="mix-total-value">${esc(total)}</text>
+        <text x="385" y="54" text-anchor="middle" class="mix-total-label">Responses</text>
+      </g>
+      ${outerCircles}
+      ${innerCircles}
     </svg>
-    <div class="mix-radial-center">
-      <b>${esc(failureRate)}%</b>
-      <span>Failed</span>
-      <small>${esc(total)} total</small>
-    </div>
   </div>
-  <div class="mix-radial-legend">
-    ${rings.map(ring => `
-      <div class="mix-radial-stat">
-        <span class="mix-radial-stat-dot ${escAttr(ring.className)}"></span>
-        <b>${esc(ring.label)}</b>
-        <span>${esc(ring.value)}</span>
-        <small>${esc(formatRateValue(ring.pct))}%</small>
-      </div>`).join('')}
+  <div class="mix-venn-stats">
+    ${segments.map(segment => `
+      <button type="button" class="mix-venn-stat ${escAttr(segment.className)}" onclick="applyStatusFilter(${jsString(segment.status)})">
+        <span class="mix-venn-stat-dot ${escAttr(segment.className)}"></span>
+        <b>${esc(segment.label)}</b>
+        <span>${esc(segment.value)}</span>
+        <small>${esc(formatRateValue(segment.pct))}%</small>
+      </button>`).join('')}
   </div>
 </div>`;
   }
 
-  function buildStatusMixRing(ring) {
-    const circumference = Math.round((2 * Math.PI * Number(ring.radius || 0)) * 100) / 100;
-    const pct = Math.max(0, Math.min(100, Number(ring.pct || 0)));
-    const dashOffset = Math.round((circumference * (1 - (pct / 100))) * 100) / 100;
+  function buildStatusMixSegment(className, status, label, value, pct, x, y) {
+    const inactive = !Number(value || 0);
+    const innerRadius = inactive ? 47 : getStatusMixWeightedRadius(pct);
+    const outerRadius = innerRadius + (inactive ? 18 : 42);
+    const labelOffset = innerRadius < 56 ? 16 : innerRadius > 82 ? 26 : 20;
+    const valueOffset = innerRadius < 56 ? 8 : innerRadius > 82 ? 16 : 12;
+    const pctOffset = innerRadius < 56 ? 26 : innerRadius > 82 ? 42 : 34;
 
-    return `
-      <circle class="mix-ring-track" cx="110" cy="110" r="${ring.radius}"></circle>
-      <circle class="mix-ring mix-ring-${escAttr(ring.className)}" cx="110" cy="110" r="${ring.radius}" stroke-dasharray="${circumference}" stroke-dashoffset="${dashOffset}" transform="rotate(-90 110 110)">
-        <title>${esc(ring.label)}: ${esc(formatRateValue(pct))}%</title>
-      </circle>`;
+    return {
+      className,
+      status,
+      label,
+      value,
+      pct,
+      x,
+      y,
+      inactive,
+      innerRadius,
+      outerRadius,
+      labelY: y - labelOffset,
+      valueY: y + valueOffset,
+      pctY: y + pctOffset
+    };
   }
 
-  function buildDrilldownCountText(total) {
+  function getStatusMixWeightedRadius(pct) {
+    const minRadius = 44;
+    const maxRadius = 92;
+    const normalizedPct = Math.max(0, Math.min(100, Number(pct || 0)));
+
+    return Math.round(minRadius + (Math.sqrt(normalizedPct / 100) * (maxRadius - minRadius)));
+  }
+
+  function buildDrilldownCountText(total, filters) {
     const recordCount = Number(total || 0);
-    if (!recordCount) return '0 latest unique record(s) shown';
+    const label = getDrilldownRecordLabel(filters);
+    if (!recordCount) return '0 ' + label + ' shown';
 
     const shown = Math.min(recordCount, CONFIG.drilldownPageSize);
-    return shown + ' of ' + recordCount + ' latest unique record(s) shown';
+    return shown + ' of ' + recordCount + ' ' + label + ' shown';
   }
 
-  function buildDrilldownPagerHtml(total) {
+  function buildDrilldownPagerHtml(total, filters) {
     if (Number(total || 0) <= CONFIG.drilldownPageSize) return '';
 
+    const label = getDrilldownRecordLabel(filters);
     return `
 <div class="drilldown-pager">
-  <span id="drilldownPagerText">Showing ${CONFIG.drilldownPageSize} of ${Number(total || 0)} latest unique</span>
+  <span id="drilldownPagerText">Showing ${CONFIG.drilldownPageSize} of ${Number(total || 0)} ${esc(label)}</span>
   <button type="button" id="loadMoreDrilldown" class="btn drilldown-load-btn" onclick="loadNextDrilldownRows()">Load Next ${CONFIG.drilldownPageSize}</button>
 </div>`;
   }
 
-  function buildTableHtml(rows) {
+  function buildTableHtml(rows, filters) {
     return `
 <div class="table-scroll">
   <table class="result-table" id="drilldownTable">
@@ -2339,7 +2770,7 @@ ${buildScript(suiteletUrl, filters)}
     </tbody>
   </table>
 </div>
-${buildDrilldownPagerHtml(rows.length)}`;
+${buildDrilldownPagerHtml(rows.length, filters)}`;
   }
 
   function buildTableRowHtml(r, index) {
@@ -2356,7 +2787,7 @@ ${buildDrilldownPagerHtml(rows.length)}`;
   <td data-sort-value="${escAttr(Number(r.id || 0))}">${buildRecordLink(r.id, r.recordUrl)}</td>
   <td data-sort-value="${escAttr(r.name)}">${buildRecordLink(r.name, r.recordUrl)}</td>
   <td data-sort-value="${createdSortValue}">${esc(r.created)}</td>
-  <td data-sort-value="${escAttr(r.status)}">${buildStatusPill(r.status)}</td>
+  <td data-sort-value="${escAttr(r.status)}">${buildStatusPill(r.status)}${r.resolvedBySuccess ? '<div class="row-note">Resolved by newer success</div>' : ''}</td>
   <td data-sort-value="${getSeverityRank(r.severity)}">${buildSeverityPill(r.severity)}</td>
   <td data-sort-value="${escAttr(String(r.priority || 'P4').replace(/\D/g, ''))}">${buildPriorityPill(r.priority)}</td>
   <td data-sort-value="${escAttr(categoryLabel)}">${esc(categoryLabel)}</td>
@@ -2392,7 +2823,11 @@ ${buildDrilldownPagerHtml(rows.length)}`;
       return '<span class="retry-note" title="Retry is disabled until retry request fields are configured.">Retry off</span>';
     }
 
-    return `<button type="button" class="mini-btn" onclick="retryRecord(${jsString(r.id)})">Retry</button>`;
+    if (!r.retryUrl) {
+      return '<span class="retry-note" title="Could not resolve the transaction internal ID needed for ordID.">No ordID</span>';
+    }
+
+    return `<a class="mini-btn retry-link" href="${escAttr(r.retryUrl)}" target="_blank" rel="noopener">Retry</a>`;
   }
 
   function buildStatusPill(status) {
@@ -2422,7 +2857,15 @@ ${buildDrilldownPagerHtml(rows.length)}`;
   var DEFAULT_RECORD_TYPE = ${JSON.stringify(defaultRecordType)};
   var RETRY_ENABLED = ${JSON.stringify(retryEnabled)};
   var DRILLDOWN_PAGE_SIZE = ${JSON.stringify(CONFIG.drilldownPageSize)};
+  var DRILLDOWN_RECORD_LABEL = ${JSON.stringify(getDrilldownRecordLabel(filters))};
   var drilldownVisibleCount = DRILLDOWN_PAGE_SIZE;
+  var AUTO_REFRESH_ENABLED_KEY = 'psiqIntegrationDashboardAutoRefreshEnabled';
+  var AUTO_REFRESH_INTERVAL_KEY = 'psiqIntegrationDashboardAutoRefreshIntervalSeconds';
+  var AUTO_REFRESH_DEFAULT_SECONDS = 300;
+  var autoRefreshTimeout = null;
+  var autoRefreshCountdownTimer = null;
+  var autoRefreshTargetTime = 0;
+  var autoRefreshEnabled = false;
 
   function applyFilters(forceDefaultTo){
     var dateToInput = document.getElementById('dateTo');
@@ -2434,12 +2877,149 @@ ${buildDrilldownPagerHtml(rows.length)}`;
     var params = new URLSearchParams({
       dateFrom: document.getElementById('dateFrom').value,
       dateTo: dateToInput ? dateToInput.value : DEFAULT_TO,
+      viewMode: document.getElementById('viewMode').value,
       status: document.getElementById('statusFilter').value,
       category: document.getElementById('categoryFilter').value,
       search: document.getElementById('globalSearch').value,
       recordType: document.getElementById('recordType').value
     });
     window.location.href = SUITELET_URL + (SUITELET_URL.indexOf('?') >= 0 ? '&' : '?') + params.toString();
+  }
+
+  function initializeAutoRefresh(){
+    var intervalSelect = document.getElementById('autoRefreshInterval');
+    var intervalSeconds = getAutoRefreshIntervalSeconds();
+
+    if(intervalSelect){
+      intervalSelect.value = String(intervalSeconds);
+    }
+
+    setAutoRefreshEnabled(safeLocalStorageGet(AUTO_REFRESH_ENABLED_KEY, 'F') === 'T', true);
+  }
+
+  function toggleAutoRefresh(){
+    setAutoRefreshEnabled(!getStoredAutoRefreshEnabled(), false);
+  }
+
+  function setAutoRefreshEnabled(enabled, skipStore){
+    autoRefreshEnabled = !!enabled;
+
+    if(!skipStore){
+      safeLocalStorageSet(AUTO_REFRESH_ENABLED_KEY, autoRefreshEnabled ? 'T' : 'F');
+    }
+
+    updateAutoRefreshUi(autoRefreshEnabled);
+
+    if(autoRefreshEnabled){
+      startAutoRefreshTimer();
+    } else {
+      stopAutoRefreshTimer();
+      updateAutoRefreshStatus();
+    }
+  }
+
+  function setAutoRefreshInterval(value){
+    var seconds = normalizeAutoRefreshInterval(value);
+    var intervalSelect = document.getElementById('autoRefreshInterval');
+
+    if(intervalSelect){
+      intervalSelect.value = String(seconds);
+    }
+
+    safeLocalStorageSet(AUTO_REFRESH_INTERVAL_KEY, String(seconds));
+
+    if(getStoredAutoRefreshEnabled()){
+      startAutoRefreshTimer();
+    }
+  }
+
+  function startAutoRefreshTimer(){
+    var seconds = getAutoRefreshIntervalSeconds();
+
+    stopAutoRefreshTimer();
+    autoRefreshTargetTime = new Date().getTime() + (seconds * 1000);
+    autoRefreshTimeout = window.setTimeout(function(){
+      applyFilters(true);
+    }, seconds * 1000);
+    autoRefreshCountdownTimer = window.setInterval(updateAutoRefreshStatus, 1000);
+    updateAutoRefreshStatus();
+  }
+
+  function stopAutoRefreshTimer(){
+    if(autoRefreshTimeout){
+      window.clearTimeout(autoRefreshTimeout);
+      autoRefreshTimeout = null;
+    }
+
+    if(autoRefreshCountdownTimer){
+      window.clearInterval(autoRefreshCountdownTimer);
+      autoRefreshCountdownTimer = null;
+    }
+
+    autoRefreshTargetTime = 0;
+  }
+
+  function updateAutoRefreshUi(enabled){
+    var toggle = document.getElementById('autoRefreshToggle');
+
+    if(!toggle) return;
+
+    toggle.textContent = enabled ? 'Auto Refresh On' : 'Auto Refresh Off';
+    if(enabled) toggle.className = 'btn auto-refresh-on';
+    else toggle.className = 'btn';
+  }
+
+  function updateAutoRefreshStatus(){
+    var status = document.getElementById('autoRefreshStatus');
+    var enabled = getStoredAutoRefreshEnabled();
+
+    if(!status) return;
+
+    if(!enabled || !autoRefreshTargetTime){
+      status.textContent = 'Auto refresh off';
+      return;
+    }
+
+    var remaining = Math.max(0, Math.ceil((autoRefreshTargetTime - new Date().getTime()) / 1000));
+    status.textContent = 'Auto refresh in ' + formatAutoRefreshCountdown(remaining);
+  }
+
+  function getStoredAutoRefreshEnabled(){
+    return autoRefreshEnabled;
+  }
+
+  function getAutoRefreshIntervalSeconds(){
+    return normalizeAutoRefreshInterval(safeLocalStorageGet(AUTO_REFRESH_INTERVAL_KEY, String(AUTO_REFRESH_DEFAULT_SECONDS)));
+  }
+
+  function normalizeAutoRefreshInterval(value){
+    var seconds = Number(value || AUTO_REFRESH_DEFAULT_SECONDS);
+    var allowed = [60, 300, 900];
+
+    return allowed.indexOf(seconds) >= 0 ? seconds : AUTO_REFRESH_DEFAULT_SECONDS;
+  }
+
+  function formatAutoRefreshCountdown(seconds){
+    var minutes = Math.floor(Number(seconds || 0) / 60);
+    var remainder = Number(seconds || 0) % 60;
+
+    return minutes + ':' + String(remainder).padStart(2, '0');
+  }
+
+  function safeLocalStorageGet(key, fallback){
+    try {
+      return window.localStorage.getItem(key) || fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function safeLocalStorageSet(key, value){
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (e) {
+      // Ignore storage failures and keep the control usable for this page load.
+    }
   }
 
   function resetDefaultRange(){
@@ -2449,6 +3029,12 @@ ${buildDrilldownPagerHtml(rows.length)}`;
     document.getElementById('categoryFilter').value = 'ALL';
     document.getElementById('globalSearch').value = '';
     document.getElementById('recordType').value = DEFAULT_RECORD_TYPE;
+    document.getElementById('viewMode').value = 'CURRENT';
+    applyFilters();
+  }
+
+  function setViewMode(mode){
+    document.getElementById('viewMode').value = mode === 'HISTORY' ? 'HISTORY' : 'CURRENT';
     applyFilters();
   }
 
@@ -2548,12 +3134,12 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 
     var countText = document.getElementById('drilldownCount');
     if(countText){
-      countText.textContent = rows.length ? drilldownVisibleCount + ' of ' + rows.length + ' latest unique record(s) shown' : '0 latest unique record(s) shown';
+      countText.textContent = rows.length ? drilldownVisibleCount + ' of ' + rows.length + ' ' + DRILLDOWN_RECORD_LABEL + ' shown' : '0 ' + DRILLDOWN_RECORD_LABEL + ' shown';
     }
 
     var pagerText = document.getElementById('drilldownPagerText');
     if(pagerText){
-      pagerText.textContent = 'Showing ' + drilldownVisibleCount + ' of ' + rows.length + ' latest unique';
+      pagerText.textContent = 'Showing ' + drilldownVisibleCount + ' of ' + rows.length + ' ' + DRILLDOWN_RECORD_LABEL;
     }
 
     var loadButton = document.getElementById('loadMoreDrilldown');
@@ -2704,6 +3290,7 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 
   updateLastRefreshed();
   initializeDrilldownPaging();
+  initializeAutoRefresh();
 </script>`;
   }
 
@@ -2717,8 +3304,11 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 .dash-topbar-right{display:flex;flex-direction:column;align-items:flex-end;gap:7px}
 .dash-refresh{color:#64748b;font-size:12px;font-weight:800;white-space:nowrap}
 .dash-actions{display:flex;gap:8px;align-items:center}
-.btn,.mini-btn{border:1px solid #d1d5db;background:#fff;color:#111827;border-radius:4px;padding:9px 13px;font-weight:700;cursor:pointer}
+.btn,.mini-btn{display:inline-block;border:1px solid #d1d5db;background:#fff;color:#111827;border-radius:4px;padding:9px 13px;font-weight:700;cursor:pointer;text-decoration:none}
 .btn-primary{background:linear-gradient(135deg,#2563eb,#0ea5e9);border-color:#2563eb;color:#fff}
+.auto-refresh-on{background:#ecfeff;border-color:#14b8a6;color:#0f766e}
+.auto-refresh-select{height:36px;border:1px solid #d1d5db;background:#fff;color:#111827;border-radius:4px;padding:0 8px;font-size:12px;font-weight:800}
+.auto-refresh-status{color:#64748b;font-size:11px;font-weight:800;white-space:nowrap}
 .mini-btn{padding:5px 9px;font-size:12px}
 .preset-row{display:flex;gap:8px;align-items:center;margin:-2px 0 10px;flex-wrap:wrap}
 .preset-btn{border:1px solid #cbd5e1;background:#fff;color:#334155;border-radius:4px;padding:6px 10px;font-size:12px;font-weight:800;cursor:pointer}
@@ -2736,6 +3326,9 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 .filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;background:#fff;border:1px solid #e5e7eb;border-radius:4px;padding:14px;margin-bottom:14px;box-shadow:0 1px 4px rgba(15,23,42,.08)}
 .filters label{display:block;font-size:12px;color:#475569;font-weight:700}
 .filters input,.filters select{display:block;width:100%;height:34px;box-sizing:border-box;margin-top:5px;border:1px solid #cbd5e1;border-radius:3px;padding:5px 8px;font-size:14px;background:#fff}
+.mode-toggle{display:grid;grid-template-columns:1fr 1fr;margin-top:5px;border:1px solid #cbd5e1;border-radius:4px;overflow:hidden;height:34px;background:#fff}
+.mode-btn{border:0;background:#fff;color:#334155;font:inherit;font-size:12px;font-weight:800;cursor:pointer}
+.mode-btn+.mode-btn{border-left:1px solid #cbd5e1}.mode-btn.active{background:linear-gradient(135deg,#2563eb,#0ea5e9);color:#fff}.mode-btn:hover:not(.active){background:#eff6ff;color:#1d4ed8}
 .kpi-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:14px}
 .kpi-card{appearance:none;text-align:left;width:100%;font:inherit;cursor:pointer;background:linear-gradient(135deg,#ffffff 0%,#f8fafc 48%,#eef2ff 100%);border:1px solid #e5e7eb;border-left:4px solid #64748b;border-radius:4px;padding:14px;box-shadow:0 1px 4px rgba(15,23,42,.08);min-height:82px}
 .kpi-card:hover{border-color:#93c5fd;box-shadow:0 4px 12px rgba(15,23,42,.12)}
@@ -2755,8 +3348,12 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 .panel-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
 .panel h2{font-size:14px;margin:0;color:#111827;font-weight:800}
 .panel-head span{display:block;font-size:12px;color:#64748b;margin-top:2px}
+.trend-panel{background:linear-gradient(135deg,#ffffff 0%,#f8fcff 56%,#eef9ff 100%)}
 .chart-wrap svg{display:block;width:100%;height:auto;min-height:320px;overflow:visible}
-.grid-line{stroke:#e5e7eb;stroke-width:1}.axis-line{stroke:#94a3b8;stroke-width:1}.axis-label{font-size:10px;fill:#64748b}.bar-value-label{font-size:10px;fill:#111827;font-weight:800;pointer-events:none}
+.trend-chart-wrap svg{filter:drop-shadow(0 6px 14px rgba(14,165,233,.08))}
+.trend-chart-bg{fill:url(#trendBackgroundGradient);stroke:#dbeafe;stroke-width:1}
+.trend-chart-wave{fill:url(#trendWaveGradient)}
+.grid-line{stroke:#d7e8f4;stroke-width:1}.axis-line{stroke:#8aa3bd;stroke-width:1.2}.axis-label{font-size:10px;fill:#64748b}.bar-value-label{font-size:10px;fill:#111827;font-weight:800;pointer-events:none}
 .trend-bar-clickable{cursor:pointer}.trend-bar-clickable:hover{opacity:.82}
 .legend{display:flex;gap:14px;justify-content:center;align-items:center;color:#64748b;font-size:12px;margin-top:4px}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:middle}.dot.good{background:#0f9f8e}.dot.bad{background:#f97316}.dot.neutral{background:#94a3b8}
@@ -2790,7 +3387,10 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 .category-chip b{font-size:11px;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .category-chip small{font-size:11px;color:#111827;font-weight:800}
 .activity-circle-wrap{display:flex;flex-direction:column;align-items:center;gap:10px;min-height:320px}
-.activity-circle-svg{display:block;width:100%;max-width:520px;height:auto;overflow:visible}
+.activity-panel{background:linear-gradient(135deg,#ffffff 0%,#f7fdff 54%,#f0fdf4 100%)}
+.activity-circle-svg{display:block;width:100%;max-width:520px;height:auto;overflow:visible;filter:drop-shadow(0 8px 18px rgba(14,165,233,.08))}
+.activity-chart-bg{fill:url(#activityPanelGradient);stroke:#dbeafe;stroke-width:1}
+.activity-chart-wave{fill:url(#activityWaveGradient)}
 .activity-orbit{fill:none;stroke:#e2e8f0;stroke-width:14;opacity:.7}
 .activity-slice{cursor:pointer;stroke:#fff;stroke-width:5;filter:drop-shadow(0 5px 8px rgba(15,23,42,.12))}
 .activity-slice:hover{opacity:.86}
@@ -2801,28 +3401,45 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 .activity-circle-label{font-size:10px;fill:#334155;font-weight:800}
 .activity-circle-count{font-size:10px;fill:#64748b;font-weight:800}
 .activity-circle-legend{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%;margin-top:2px}
-.activity-chip{display:grid;grid-template-columns:12px 1fr auto;gap:7px;align-items:center;border:1px solid #e5e7eb;background:linear-gradient(135deg,#fff,#f8fafc);border-radius:4px;padding:7px 8px;cursor:pointer;text-align:left;font:inherit;min-width:0}
-.activity-chip:hover{border-color:#93c5fd;background:linear-gradient(135deg,#fff,#eff6ff)}
+.activity-chip{display:grid;grid-template-columns:12px 1fr auto;gap:7px;align-items:center;border:1px solid #dbeafe;background:linear-gradient(135deg,#ffffff 0%,#f8fcff 56%,#eef9ff 100%);border-radius:4px;padding:7px 8px;cursor:pointer;text-align:left;font:inherit;min-width:0}
+.activity-chip:hover{border-color:#93c5fd;background:linear-gradient(135deg,#ffffff,#ecfeff)}
 .activity-chip-dot{width:10px;height:10px;border-radius:50%}
 .activity-chip b{font-size:11px;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .activity-chip small{font-size:11px;color:#111827;font-weight:800}
 .empty-chart{height:160px;display:flex;align-items:center;justify-content:center;color:#64748b;font-weight:700;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:4px}
-.mix-card{display:flex;flex-direction:column;align-items:center;padding:8px 4px 0}
-.mix-radial-wrap{position:relative;width:min(100%,290px);aspect-ratio:1;margin:0 auto 8px}
-.mix-radial-svg{display:block;width:100%;height:100%;overflow:visible}
-.mix-ring-track{fill:none;stroke:#edf2f7;stroke-width:13}
-.mix-ring{fill:none;stroke-width:13;stroke-linecap:round;filter:drop-shadow(0 2px 3px rgba(15,23,42,.12))}
-.mix-ring-failed{stroke:url(#mixFailedGradient)}.mix-ring-success{stroke:url(#mixSuccessGradient)}.mix-ring-unknown{stroke:url(#mixUnknownGradient)}
-.mix-radial-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;pointer-events:none}
-.mix-radial-center b{display:block;color:#111827;font-size:34px;line-height:1;font-weight:800}
-.mix-radial-center span{display:block;color:#f97316;font-size:13px;font-weight:800;margin-top:7px}
-.mix-radial-center small{display:block;color:#64748b;font-size:11px;font-weight:800;margin-top:4px;text-transform:uppercase;letter-spacing:.04em}
-.mix-radial-legend{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;width:100%;margin-top:4px}
-.mix-radial-stat{display:grid;grid-template-columns:10px 1fr auto;gap:7px;align-items:center;background:#f8fafc;border:1px solid #e5e7eb;border-radius:4px;padding:9px 10px;min-width:0}
-.mix-radial-stat-dot{width:9px;height:9px;border-radius:50%}.mix-radial-stat-dot.success{background:#0f9f8e}.mix-radial-stat-dot.failed{background:#f97316}.mix-radial-stat-dot.unknown{background:#94a3b8}
-.mix-radial-stat b{font-size:11px;color:#334155;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mix-radial-stat span{font-size:13px;color:#111827;font-weight:800}
-.mix-radial-stat small{grid-column:2 / span 2;color:#64748b;font-size:11px;font-weight:800}
+.mix-card{display:flex;flex-direction:column;align-items:stretch;padding:6px 2px 0}
+.mix-panel{background:linear-gradient(135deg,#ffffff 0%,#f8fcff 48%,#fff7ed 100%)}
+.mix-venn-shell{display:flex;justify-content:center;align-items:center;width:100%;min-height:292px}
+.mix-venn-svg{display:block;width:100%;max-width:540px;height:auto;overflow:visible}
+.mix-venn-bg{fill:url(#mixVennBackgroundGradient);stroke:#dbeafe;stroke-width:1}
+.mix-total-badge rect{fill:#f8fafc;stroke:#dbeafe;stroke-width:1.2}
+.mix-total-value{font-size:17px;fill:#111827;font-weight:800}
+.mix-total-label{font-size:9px;fill:#64748b;font-weight:800;text-transform:uppercase;letter-spacing:.08em}
+.mix-venn-outer{opacity:.44;mix-blend-mode:multiply}
+.mix-venn-outer.failed{fill:#fde68a}
+.mix-venn-outer.success{fill:#99f6e4}
+.mix-venn-outer.unknown{fill:#bfdbfe}
+.mix-venn-outer.inactive{fill:none;stroke:#bfdbfe;stroke-width:4;stroke-dasharray:9 8;opacity:.86;mix-blend-mode:normal}
+.mix-venn-bubble{cursor:pointer}
+.mix-venn-inner{filter:drop-shadow(0 8px 14px rgba(15,23,42,.12));transition:opacity .12s ease}
+.mix-venn-inner.failed{fill:#fbbf24}
+.mix-venn-inner.success{fill:#14b8a6}
+.mix-venn-inner.unknown{fill:#38bdf8}
+.mix-venn-bubble.inactive .mix-venn-inner{fill:#f8fcff;stroke:#38bdf8;stroke-width:3;stroke-dasharray:7 7;filter:none}
+.mix-venn-bubble:hover .mix-venn-inner{opacity:.88}
+.mix-venn-label{font-size:13px;fill:#fff;font-weight:800;letter-spacing:.05em}
+.mix-venn-value{font-size:29px;fill:#fff;font-weight:800}
+.mix-venn-pct{font-size:12px;fill:rgba(255,255,255,.9);font-weight:800}
+.mix-venn-bubble.success .mix-venn-label{font-size:14px}.mix-venn-bubble.success .mix-venn-value{font-size:36px}.mix-venn-bubble.success .mix-venn-pct{font-size:14px}
+.mix-venn-bubble.compact .mix-venn-label{font-size:10px}.mix-venn-bubble.compact .mix-venn-value{font-size:24px}.mix-venn-bubble.compact .mix-venn-pct{font-size:10px}
+.mix-venn-bubble.inactive .mix-venn-label,.mix-venn-bubble.inactive .mix-venn-value,.mix-venn-bubble.inactive .mix-venn-pct{fill:#64748b;text-shadow:none}
+.mix-venn-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;width:100%;margin-top:4px}
+.mix-venn-stat{display:grid;grid-template-columns:10px 1fr auto;gap:7px;align-items:center;background:linear-gradient(135deg,#ffffff 0%,#f8fcff 62%,#eef9ff 100%);border:1px solid #dbeafe;border-radius:4px;padding:9px 10px;min-width:0;text-align:left;font:inherit;cursor:pointer}
+.mix-venn-stat:hover{border-color:#93c5fd;background:#f8fcff}
+.mix-venn-stat-dot{width:9px;height:9px;border-radius:50%}.mix-venn-stat-dot.success{background:#14b8a6}.mix-venn-stat-dot.failed{background:#fbbf24}.mix-venn-stat-dot.unknown{background:#38bdf8}
+.mix-venn-stat b{font-size:11px;color:#334155;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mix-venn-stat span{font-size:13px;color:#111827;font-weight:800}
+.mix-venn-stat small{grid-column:2 / span 2;color:#64748b;font-size:11px;font-weight:800}
 .table-panel{padding-bottom:10px}
 .table-scroll{overflow:auto;max-height:620px;border-top:1px solid #e5e7eb}
 .drilldown-pager{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid #e5e7eb;padding:10px 0 0;margin-top:10px;color:#64748b;font-size:12px;font-weight:800}
@@ -2840,12 +3457,14 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 .link-button{border:0;background:transparent;padding:0;text-align:left;cursor:pointer;font:inherit}
 .status-pill{display:inline-block;border-radius:999px;padding:4px 9px;font-weight:800;font-size:11px}
 .status-pill.success{background:#ccfbf1;color:#115e59}.status-pill.failed{background:#ffedd5;color:#9a3412}.status-pill.unknown{background:#e2e8f0;color:#334155}
+.row-note{color:#047857;font-size:10px;font-weight:800;margin-top:5px;white-space:nowrap}
 .severity-pill,.priority-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-weight:800;font-size:10px;white-space:nowrap}
 .severity-pill.critical{background:#fee2e2;color:#991b1b}.severity-pill.high{background:#ffedd5;color:#9a3412}.severity-pill.medium{background:#fef9c3;color:#854d0e}.severity-pill.low{background:#dbeafe;color:#1d4ed8}.severity-pill.info{background:#ccfbf1;color:#115e59}
 .priority-pill.p1{background:#991b1b;color:#fff}.priority-pill.p2{background:#f97316;color:#fff}.priority-pill.p3{background:#eab308;color:#422006}.priority-pill.p4{background:#e2e8f0;color:#334155}
 .message-btn{border:0;background:transparent;color:#2563eb;font-weight:800;padding:5px 0 0;cursor:pointer}
 .message-source{display:none}
 .retry-note{display:inline-block;border:1px solid #e5e7eb;background:#f8fafc;color:#64748b;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:800;white-space:nowrap}
+.retry-link{padding:5px 9px;font-size:12px}
 .modal-backdrop{display:none;position:fixed;z-index:9999;inset:0;background:rgba(15,23,42,.42);align-items:center;justify-content:center;padding:20px}
 .message-modal{background:#fff;border-radius:6px;box-shadow:0 18px 60px rgba(15,23,42,.30);width:min(780px,96vw);max-height:82vh;display:flex;flex-direction:column}
 .message-modal-head{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #e5e7eb;padding:12px 14px}
@@ -2853,8 +3472,9 @@ ${buildDrilldownPagerHtml(rows.length)}`;
 .icon-btn{width:30px;height:30px;border:1px solid #cbd5e1;background:#fff;border-radius:4px;color:#334155;font-weight:800;cursor:pointer}
 .message-modal pre{white-space:pre-wrap;margin:0;padding:14px;overflow:auto;background:#f8fafc;color:#1f2937;font-size:13px;line-height:1.45;max-height:64vh}
 .empty-row{text-align:center;color:#64748b;font-weight:800;padding:30px!important}
+.dash-footer{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:14px;padding:12px 2px 0;border-top:1px solid #e5e7eb;color:#64748b;font-size:12px;font-weight:700}.version-badge{background:#eef2ff;border:1px solid #dbeafe;color:#334155;border-radius:999px;padding:3px 8px;font-weight:800}
 @media(max-width:1200px){.kpi-grid{grid-template-columns:repeat(3,1fr)}.insight-grid{grid-template-columns:repeat(2,1fr)}.analysis-grid,.analysis-grid.lower{grid-template-columns:1fr}}
-@media(max-width:760px){.dash-topbar{align-items:flex-start;flex-direction:column}.dash-topbar-right{width:100%;align-items:flex-start}.filters{grid-template-columns:1fr}.kpi-grid,.insight-grid,.trend-gauge-grid{grid-template-columns:1fr}.dash-actions{width:100%;flex-direction:column}.btn{width:100%}.drilldown-pager{align-items:stretch;flex-direction:column}.activity-circle-legend,.category-circle-legend,.mix-radial-legend{grid-template-columns:1fr}}
+@media(max-width:760px){.dash-topbar{align-items:flex-start;flex-direction:column}.dash-topbar-right{width:100%;align-items:flex-start}.filters{grid-template-columns:1fr}.kpi-grid,.insight-grid,.trend-gauge-grid{grid-template-columns:1fr}.dash-actions{width:100%;flex-direction:column;align-items:stretch}.btn,.auto-refresh-select{width:100%}.dash-footer{justify-content:flex-start}.drilldown-pager{align-items:stretch;flex-direction:column}.activity-circle-legend,.category-circle-legend,.mix-venn-stats{grid-template-columns:1fr}.mix-venn-shell{min-height:250px}}
 </style>`;
   }
 

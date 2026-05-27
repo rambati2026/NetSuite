@@ -3,7 +3,7 @@
  * @NScriptType Suitelet
  * Ramakrishna Ambati
  * Date : Apr/12/2026
- * Script for vendor activity list
+ * Script for vendor Email Template Delivery activity list
  */
 define(['N/search', 'N/file', 'N/log', 'N/ui/serverWidget', 'N/url', 'N/format'], (
   search,

@@ -15,8 +15,11 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
 ) => {
   const CONFIG = {
     dashboardTitle: 'Employee Last Login Monitor',
-    developedBy: 'Ramakrishna Ambati',
-    version: '1.6.25',
+    developedBy: 'Rama Ambati',
+    version: '1.6.32',
+    developerTitle: 'NetSuite Administrator',
+    developerEmployeeNames: ['Rama Ambati', 'Ramakrishna Ambati'],
+    developerEmployeeEmails: ['rambati@psiquantum.com'],
     allowedAccounts: ['5775522', '5775522_SB1', '5775522_SB2'],
     pageSize: 1000,
     summaryRowLimit: 10000,
@@ -1095,6 +1098,7 @@ ${buildCss()}
 
   ${buildWarningsHtml(data.warnings || [])}
   ${buildKpiHtml(data.summary, data.rows || [])}
+  ${buildDepartmentDistributionTileHtml(data.rows || [])}
   ${buildTodayRoleTrendHtml(data.todayRoleTrend, filters)}
   ${buildMonthlyRoleTrendHtml(data.monthlyRoleTrend, filters)}
 
@@ -1109,7 +1113,7 @@ ${buildCss()}
   </section>
 
   <div class="dash-footer">
-    <span>Developed by ${esc(CONFIG.developedBy)}</span>
+    ${buildDeveloperCreditHtml()}
     <span class="version-badge">v${esc(CONFIG.version)}</span>
   </div>
 </div>
@@ -1137,6 +1141,35 @@ ${buildCss()}
     return warnings.map(warning => {
       return `<div class="warning-banner">${esc(warning)}</div>`;
     }).join('');
+  }
+
+  function buildDeveloperCreditHtml() {
+    return `<span class="developer-credit">Developed by <strong>${esc(CONFIG.developedBy)}</strong>${buildDeveloperAdminBadgeHtml(false)}</span>`;
+  }
+
+  function buildDeveloperAdminBadgeHtml(compact) {
+    const className = compact ? 'developer-admin-badge compact' : 'developer-admin-badge';
+    const label = compact ? 'Dev' : 'Dashboard Developer';
+    const title = CONFIG.developedBy + ' | ' + CONFIG.developerTitle;
+
+    return `<span class="${className}" title="${escAttr(title)}">
+      <span class="developer-admin-icon" aria-hidden="true">🧑🏻‍💻</span>
+      <span class="developer-admin-label">${esc(label)}</span>
+      ${compact ? '' : `<small>${esc(CONFIG.developerTitle)}</small>`}
+    </span>`;
+  }
+
+  function isDashboardDeveloperEmployee(employee) {
+    const name = normalizeDeveloperMatchText(employee && employee.name);
+    const email = normalizeDeveloperMatchText(employee && employee.email);
+    const names = (CONFIG.developerEmployeeNames || []).map(normalizeDeveloperMatchText);
+    const emails = (CONFIG.developerEmployeeEmails || []).map(normalizeDeveloperMatchText);
+
+    return (name && names.indexOf(name) >= 0) || (email && emails.indexOf(email) >= 0);
+  }
+
+  function normalizeDeveloperMatchText(value) {
+    return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
   function buildKpiHtml(summary, rows) {
@@ -1243,7 +1276,7 @@ ${buildCss()}
 
     return `
 <tr>
-  <td>${buildEmployeeLink(row)}</td>
+  <td data-export-label="${escAttr(row.name || '')}">${buildEmployeeLink(row)}</td>
   <td>${esc(row.email)}</td>
   <td>${esc(getDepartmentName(row))}</td>
   <td>${esc(row.roleName || 'No successful login role')}</td>
@@ -1398,6 +1431,188 @@ ${buildCss()}
 </div>`;
   }
 
+  function buildDepartmentDistributionTileHtml(rows) {
+    const allRows = rows || [];
+    const sourceRows = buildKpiDepartmentSummaryRows(allRows);
+    const totalEmployees = sourceRows.reduce((sum, row) => sum + Number(row.total || 0), 0);
+    const departmentRows = buildDepartmentDistributionRows(sourceRows, 10);
+
+    return `
+<section class="panel department-distribution-panel">
+  <div class="panel-head">
+    <div>
+      <h2>Employees by Department</h2>
+      <span>${esc(formatWholeNumber(totalEmployees))} employee(s) across ${esc(formatWholeNumber(sourceRows.length))} department bucket(s) | Top 10 ranking</span>
+    </div>
+    <button type="button" class="btn btn-small" onclick="exportTableCsv('departmentDistributionTable', 'employees_by_department.csv')">Export CSV</button>
+  </div>
+  ${departmentRows.length ? `
+    <div class="department-distribution-body">
+      <div class="department-donut-wrap">
+        ${buildDepartmentDonutSvg(departmentRows, totalEmployees)}
+      </div>
+      ${buildDepartmentRankingTableHtml(departmentRows)}
+    </div>
+    ${buildDepartmentEmployeeDetailHtml(departmentRows, allRows)}` : '<div class="empty-chart">No department data found in the current result set.</div>'}
+</section>`;
+  }
+
+  function buildDepartmentDistributionRows(sourceRows, limit) {
+    const totalEmployees = (sourceRows || []).reduce((sum, row) => sum + Number(row.total || 0), 0);
+    const visibleLimit = Math.max(1, Number(limit || 10));
+    const visibleRows = (sourceRows || []).slice(0, visibleLimit);
+    const hiddenRows = (sourceRows || []).slice(visibleLimit);
+
+    if (hiddenRows.length) {
+      visibleRows.push({
+        departmentName: 'Other Departments',
+        total: hiddenRows.reduce((sum, row) => sum + Number(row.total || 0), 0),
+        loggedIn: hiddenRows.reduce((sum, row) => sum + Number(row.loggedIn || 0), 0),
+        stale: hiddenRows.reduce((sum, row) => sum + Number(row.stale || 0), 0),
+        neverLogged: hiddenRows.reduce((sum, row) => sum + Number(row.neverLogged || 0), 0),
+        inactive: hiddenRows.reduce((sum, row) => sum + Number(row.inactive || 0), 0),
+        hiddenDepartmentNames: hiddenRows.map(row => row.departmentName)
+      });
+    }
+
+    return visibleRows.map((row, index) => {
+      const count = Number(row.total || 0);
+
+      return Object.assign({}, row, {
+        rank: index + 1,
+        color: getRoleColor(index),
+        percentage: totalEmployees ? (count / totalEmployees) * 100 : 0
+      });
+    }).filter(row => Number(row.total || 0) > 0);
+  }
+
+  function buildDepartmentDonutSvg(departmentRows, totalEmployees) {
+    const size = 260;
+    const center = size / 2;
+    const radius = 76;
+    const strokeWidth = 34;
+    const circumference = 2 * Math.PI * radius;
+    let offset = 0;
+
+    const segments = (departmentRows || []).map(row => {
+      const value = Number(row.total || 0);
+      const dash = totalEmployees ? (value / totalEmployees) * circumference : 0;
+      const gap = Math.max(0, circumference - dash);
+      const segmentOffset = -offset;
+      const title = row.departmentName + ': ' + formatWholeNumber(value) + ' employee(s), ' + formatOneDecimal(row.percentage) + '%';
+      offset += dash;
+
+      return `<circle cx="${center}" cy="${center}" r="${radius}" fill="none" stroke="${escAttr(row.color)}" stroke-width="${strokeWidth}" stroke-dasharray="${roundSvgNumber(dash)} ${roundSvgNumber(gap)}" stroke-dashoffset="${roundSvgNumber(segmentOffset)}" transform="rotate(-90 ${center} ${center})" class="department-donut-segment">
+        <title>${escAttr(title)}</title>
+      </circle>`;
+    }).join('');
+
+    let labelOffset = 0;
+    const labels = (departmentRows || []).map(row => {
+      const value = Number(row.total || 0);
+      const dash = totalEmployees ? (value / totalEmployees) * circumference : 0;
+      const percentage = Number(row.percentage || 0);
+      const midRatio = (labelOffset + (dash / 2)) / circumference;
+      const labelAngle = (midRatio * Math.PI * 2) - (Math.PI / 2);
+      const labelRadius = 93;
+      const x = center + (Math.cos(labelAngle) * labelRadius);
+      const y = center + (Math.sin(labelAngle) * labelRadius);
+      labelOffset += dash;
+
+      if (percentage < 4) return '';
+
+      return `<text x="${roundSvgNumber(x)}" y="${roundSvgNumber(y)}" text-anchor="middle" dominant-baseline="middle" class="department-donut-label">${esc(formatOneDecimal(percentage))}%</text>`;
+    }).join('');
+
+    return `
+<svg class="department-donut-svg" viewBox="0 0 ${size} ${size}" role="img" aria-label="Employee count by department">
+  <circle cx="${center}" cy="${center}" r="${radius}" fill="none" stroke="#e5e7eb" stroke-width="${strokeWidth}" class="department-donut-bg"></circle>
+  ${segments}
+  ${labels}
+  <circle cx="${center}" cy="${center}" r="48" class="department-donut-hole"></circle>
+  <text x="${center}" y="${center - 4}" text-anchor="middle" class="department-donut-total">${esc(formatWholeNumber(totalEmployees))}</text>
+  <text x="${center}" y="${center + 17}" text-anchor="middle" class="department-donut-caption">Employees</text>
+</svg>`;
+  }
+
+  function buildDepartmentRankingTableHtml(departmentRows) {
+    return `
+<div class="department-ranking-table-wrap">
+  <table class="department-ranking-table" id="departmentDistributionTable">
+    <thead>
+      <tr>
+        <th>Rank</th>
+        <th>Department</th>
+        <th>Employees</th>
+        <th>Share</th>
+        <th>Logged In</th>
+        <th>Stale / No Login</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${(departmentRows || []).map((row, index) => `
+        <tr data-department-index="${escAttr(index)}">
+          <td><span class="department-rank-chip" style="background:${escAttr(row.color)}">${esc(row.rank)}</span></td>
+          <td data-export-label="${escAttr(row.departmentName)}">
+            <button type="button" class="department-rank-name department-drilldown-button" onclick="showDepartmentEmployees(${index})" aria-label="${escAttr('Show employees for ' + row.departmentName)}">
+              <span class="department-rank-dot" style="background:${escAttr(row.color)}"></span>${esc(row.departmentName)}
+            </button>
+          </td>
+          <td data-export-label="${escAttr(formatWholeNumber(row.total))}">
+            <button type="button" class="department-count-button" onclick="showDepartmentEmployees(${index})" aria-label="${escAttr('Show ' + formatWholeNumber(row.total) + ' employees for ' + row.departmentName)}">${esc(formatWholeNumber(row.total))}</button>
+          </td>
+          <td>${esc(formatOneDecimal(row.percentage))}%</td>
+          <td>${esc(formatWholeNumber(row.loggedIn))}</td>
+          <td>${esc(formatWholeNumber(row.stale))}</td>
+        </tr>`).join('')}
+    </tbody>
+  </table>
+</div>`;
+  }
+
+  function buildDepartmentEmployeeDetailHtml(departmentRows, rows) {
+    return `
+<div class="department-employee-detail" id="departmentEmployeeDetail">
+  <div class="department-employee-detail-empty" id="departmentEmployeeDetailEmpty">Select a department row to view matching employees.</div>
+  ${(departmentRows || []).map((department, index) => {
+    const employeeRows = buildDepartmentEmployeeRows(department, rows);
+    const tableId = 'departmentEmployeeTable' + index;
+    const panelId = 'departmentEmployees' + index;
+    const filename = 'department_employees_' + department.departmentName;
+
+    return `
+      <div class="department-employee-panel" id="${escAttr(panelId)}" style="display:none">
+        <div class="today-role-detail-head">
+          <div>
+            <b>${esc(department.departmentName)}</b>
+            <span>${esc(formatWholeNumber(employeeRows.length))} employee(s) in this department from current filters</span>
+          </div>
+          <button type="button" class="btn btn-small" onclick="exportTableCsv('${escAttr(tableId)}', '${escAttr(filename)}')">Export CSV</button>
+        </div>
+        ${employeeRows.length ? buildKpiEmployeeTableHtml(tableId, employeeRows) : '<div class="empty-chart">No employees matched this department in the current result set.</div>'}
+      </div>`;
+  }).join('')}
+</div>`;
+  }
+
+  function buildDepartmentEmployeeRows(department, rows) {
+    const hiddenDepartmentMap = {};
+
+    (department.hiddenDepartmentNames || []).forEach(name => {
+      hiddenDepartmentMap[String(name || '')] = true;
+    });
+
+    return (rows || []).filter(row => {
+      const departmentName = getDepartmentName(row);
+
+      if (department.departmentName === 'Other Departments') {
+        return !!hiddenDepartmentMap[departmentName];
+      }
+
+      return departmentName === department.departmentName;
+    }).slice().sort(compareEmployeeRows);
+  }
+
   function buildTodayRoleTrendHtml(trend, filters) {
     const roleCount = trend && trend.roles ? trend.roles.length : 0;
     const hiddenRoleText = trend && trend.hiddenRoleCount ?
@@ -1519,11 +1734,16 @@ ${buildCss()}
     const name = employee.name || employee.email || 'Unnamed employee';
     const weekendLogin = !!employee.weekendLogin;
     const weekendLabel = employee.weekendLoginLabel || 'Weekend';
+    const dashboardDeveloper = isDashboardDeveloperEmployee({
+      name,
+      email: employee.email
+    });
 
     return `
-<button type="button" class="today-role-employee employee-export-row${weekendLogin ? ' weekend-login-member' : ''}" data-employee-id="${escAttr(employee.id || employee.email || name)}" data-employee-name="${escAttr(name)}" data-employee-email="${escAttr(employee.email || '')}" data-employee-department="${escAttr(employee.department || 'No Department')}" data-employee-last-login="${escAttr(employee.lastLogin || 'Not available')}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-weekend-login-label="${escAttr(weekendLogin ? weekendLabel : '')}" data-employee-url="${escAttr(employee.employeeUrl || '')}" onclick="openEmployeeLoginPopup(this)">
+<button type="button" class="today-role-employee employee-export-row${weekendLogin ? ' weekend-login-member' : ''}${dashboardDeveloper ? ' dashboard-developer-member' : ''}" data-employee-id="${escAttr(employee.id || employee.email || name)}" data-employee-name="${escAttr(name)}" data-employee-email="${escAttr(employee.email || '')}" data-employee-department="${escAttr(employee.department || 'No Department')}" data-employee-last-login="${escAttr(employee.lastLogin || 'Not available')}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-weekend-login-label="${escAttr(weekendLogin ? weekendLabel : '')}" data-dashboard-developer="${dashboardDeveloper ? 'T' : 'F'}" data-employee-url="${escAttr(employee.employeeUrl || '')}" onclick="openEmployeeLoginPopup(this)">
   <b>${esc(name)}</b>
   ${employee.email ? `<small>${esc(employee.email)}</small>` : ''}
+  ${dashboardDeveloper ? buildDeveloperAdminBadgeHtml(true) : ''}
   ${weekendLogin ? `<span class="weekend-login-badge">${esc(weekendLabel)}</span>` : ''}
 </button>`;
   }
@@ -1536,6 +1756,7 @@ ${buildCss()}
       <div>
         <h2 id="employeePopupName">Employee Login Detail</h2>
         <span id="employeePopupEmail"></span>
+        <span id="employeePopupDeveloperBadge" class="developer-popup-badge" style="display:none">${buildDeveloperAdminBadgeHtml(false)}</span>
       </div>
       <button type="button" class="employee-popup-close" onclick="closeEmployeeLoginPopup()" aria-label="Close employee detail">x</button>
     </div>
@@ -1617,6 +1838,33 @@ ${buildCss()}
         <title>${escAttr(month.title)}</title>
       </rect>`;
     }).join('');
+    const totalLinePoints = months.map((month, monthIndex) => {
+      const value = Number(month.total || 0);
+      return {
+        x: left + (slot * monthIndex) + (slot / 2),
+        y: baseline - ((value / max) * plotHeight),
+        value,
+        title: month.title
+      };
+    });
+    const totalLinePointText = totalLinePoints.map(point => {
+      return roundSvgNumber(point.x) + ',' + roundSvgNumber(point.y);
+    }).join(' ');
+    const totalTrendLine = totalLinePoints.length > 1 ? `
+    <polyline points="${escAttr(totalLinePointText)}" class="monthly-total-line-shadow"></polyline>
+    <polyline points="${escAttr(totalLinePointText)}" class="monthly-total-line"></polyline>
+    ${totalLinePoints.map(point => `
+      <g class="monthly-total-point">
+        <title>${escAttr(point.title + ': ' + formatWholeNumber(point.value) + ' total employee logins')}</title>
+        <circle cx="${roundSvgNumber(point.x)}" cy="${roundSvgNumber(point.y)}" r="4.5" class="monthly-total-point-ring"></circle>
+        <circle cx="${roundSvgNumber(point.x)}" cy="${roundSvgNumber(point.y)}" r="2" class="monthly-total-point-core"></circle>
+      </g>`).join('')}
+    <g class="monthly-total-line-legend">
+      <line x1="${width - right - 166}" y1="24" x2="${width - right - 126}" y2="24" class="monthly-total-line"></line>
+      <circle cx="${width - right - 146}" cy="24" r="4.5" class="monthly-total-point-ring"></circle>
+      <circle cx="${width - right - 146}" cy="24" r="2" class="monthly-total-point-core"></circle>
+      <text x="${width - right - 116}" y="28">Total trend</text>
+    </g>` : '';
 
     const bars = months.map((month, monthIndex) => {
       const x = left + (slot * monthIndex) + ((slot - barWidth) / 2);
@@ -1665,6 +1913,7 @@ ${buildCss()}
     ${monthHighlights}
     ${grid}
     ${bars}
+    ${totalTrendLine}
     <line x1="${left}" y1="${baseline}" x2="${width - right}" y2="${baseline}" class="axis-line"></line>
   </svg>
 </div>`;
@@ -1804,9 +2053,12 @@ ${buildCss()}
 
     const label = role.roleName + ' | ' + month.title + ': ' + value + ' employee(s)';
     const heatmapStyle = getMonthlyMatrixHeatmapStyle(value, maxMatrixCellValue);
+    const isHighestValue = value === Number(maxMatrixCellValue || 0);
+    const buttonClass = 'role-matrix-count' + (isHighestValue ? ' highest-value' : '');
+    const title = (isHighestValue ? 'Highest monthly count | ' : '') + label;
 
     return `<td>
-            <button type="button" class="role-matrix-count" style="${escAttr(heatmapStyle)}" data-role-index="${escAttr(roleIndex)}" data-month-index="${escAttr(monthIndex)}" onclick="showMonthlyMatrixEmployees(${roleIndex}, ${monthIndex})" aria-label="${escAttr('View employees for ' + label)}" title="${escAttr(label)}">${esc(formatWholeNumber(value))}</button>
+            <button type="button" class="${escAttr(buttonClass)}" style="${escAttr(heatmapStyle)}" data-role-index="${escAttr(roleIndex)}" data-month-index="${escAttr(monthIndex)}" data-highest-value="${isHighestValue ? 'T' : 'F'}" onclick="showMonthlyMatrixEmployees(${roleIndex}, ${monthIndex})" aria-label="${escAttr('View employees for ' + title)}" title="${escAttr(title)}">${esc(formatWholeNumber(value))}</button>
           </td>`;
   }
 
@@ -2017,7 +2269,7 @@ ${buildDetailTableFilterHtml(rows)}
 
     return `
 <tr class="${weekendLogin ? 'weekend-login-row' : ''}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-detail-search="${escAttr(searchText)}" data-role="${escAttr(roleName)}" data-status="${escAttr(status.className)}" data-login-state="${row.lastLoginDate ? 'logged' : 'never'}" data-stale="${row.stale ? 'T' : 'F'}" data-days="${escAttr(row.daysSinceLogin === null ? '' : row.daysSinceLogin)}" data-sort-employee="${escAttr(row.name || '')}" data-sort-last-login="${escAttr(lastLoginTime)}" data-sort-role="${escAttr(roleName)}" data-sort-days="${escAttr(daysSortValue)}" data-sort-status="${escAttr(status.text)}">
-  <td>${buildEmployeeLink(row)}</td>
+  <td data-export-label="${escAttr(row.name || '')}">${buildEmployeeLink(row)}</td>
   <td>${esc(row.email)}</td>
   <td data-sort-value="${escAttr(lastLoginTime)}" data-export-label="${escAttr(row.lastLogin || 'Never logged in')}">${esc(row.lastLogin || 'Never logged in')}${weekendLogin ? `<span class="weekend-login-table-badge">${esc(weekendLoginLabel)}</span>` : ''}</td>
   <td>${esc(roleName)}</td>
@@ -2053,9 +2305,10 @@ ${buildDetailTableFilterHtml(rows)}
 
   function buildEmployeeLink(row) {
     if (!row.name) return '';
-    if (!row.employeeUrl) return esc(row.name);
+    const developerBadge = isDashboardDeveloperEmployee(row) ? buildDeveloperAdminBadgeHtml(true) : '';
+    if (!row.employeeUrl) return esc(row.name) + developerBadge;
 
-    return `<a class="table-link" href="${escAttr(row.employeeUrl)}" target="_blank" rel="noopener">${esc(row.name)}</a>`;
+    return `<a class="table-link" href="${escAttr(row.employeeUrl)}" target="_blank" rel="noopener">${esc(row.name)}</a>${developerBadge}`;
   }
 
   function buildEmployeeUrl(id) {
@@ -2387,6 +2640,37 @@ ${buildDetailTableFilterHtml(rows)}
     if(foundPanel && detail.scrollIntoView) detail.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
+  function showDepartmentEmployees(departmentIndex){
+    var detail = document.getElementById('departmentEmployeeDetail');
+    if(!detail) return;
+
+    var empty = document.getElementById('departmentEmployeeDetailEmpty');
+    var panels = detail.querySelectorAll('.department-employee-panel');
+    var rows = document.querySelectorAll('#departmentDistributionTable tbody tr');
+    var targetId = 'departmentEmployees' + departmentIndex;
+    var foundPanel = false;
+
+    for(var i = 0; i < panels.length; i++){
+      if(panels[i].id === targetId){
+        panels[i].style.display = 'block';
+        foundPanel = true;
+      } else {
+        panels[i].style.display = 'none';
+      }
+    }
+
+    for(var j = 0; j < rows.length; j++){
+      if(Number(rows[j].getAttribute('data-department-index')) === Number(departmentIndex)){
+        rows[j].classList.add('active');
+      } else {
+        rows[j].classList.remove('active');
+      }
+    }
+
+    if(empty) empty.style.display = foundPanel ? 'none' : 'block';
+    if(foundPanel && detail.scrollIntoView) detail.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
   function sortEmployeeLoginTable(sortKey){
     var table = document.getElementById('employeeLoginTable');
     if(!table || !table.tBodies || !table.tBodies.length) return;
@@ -2636,10 +2920,12 @@ ${buildDetailTableFilterHtml(rows)}
     var lastLogin = employee.getAttribute('data-employee-last-login') || 'Not available';
     var weekendLogin = employee.getAttribute('data-weekend-login') === 'T';
     var weekendLoginLabel = employee.getAttribute('data-weekend-login-label') || 'Weekend';
+    var dashboardDeveloper = employee.getAttribute('data-dashboard-developer') === 'T';
     var employeeUrl = employee.getAttribute('data-employee-url') || '';
     var role = panel ? (panel.getAttribute('data-export-role') || '') : '';
     var period = panel ? (panel.getAttribute('data-export-period') || '') : '';
     var recordLink = document.getElementById('employeePopupRecordLink');
+    var developerBadge = document.getElementById('employeePopupDeveloperBadge');
 
     setPopupText('employeePopupName', name);
     setPopupText('employeePopupEmail', email);
@@ -2648,6 +2934,16 @@ ${buildDetailTableFilterHtml(rows)}
     setPopupText('employeePopupWeekendLogin', weekendLogin ? weekendLoginLabel : 'No');
     setPopupText('employeePopupRole', role || 'Not available');
     setPopupText('employeePopupPeriod', period || 'Not available');
+
+    if(developerBadge){
+      developerBadge.style.display = dashboardDeveloper ? 'inline-flex' : 'none';
+    }
+
+    if(dashboardDeveloper){
+      popup.classList.add('dashboard-developer-popup');
+    } else {
+      popup.classList.remove('dashboard-developer-popup');
+    }
 
     if(recordLink){
       if(employeeUrl){
@@ -2866,6 +3162,35 @@ ${buildDetailTableFilterHtml(rows)}
 .kpi-employee-table td,.kpi-role-summary-table td,.kpi-department-summary-table td{border-bottom:1px solid #e5e7eb;padding:8px 9px;color:#1f2937;vertical-align:top}
 .kpi-employee-table tbody tr:nth-child(even) td,.kpi-role-summary-table tbody tr:nth-child(even) td,.kpi-department-summary-table tbody tr:nth-child(even) td{background:#fbfdff}
 .kpi-role-summary-table th:not(:first-child),.kpi-role-summary-table td:not(:first-child),.kpi-department-summary-table th:not(:first-child),.kpi-department-summary-table td:not(:first-child){text-align:right}
+.department-distribution-panel{margin-bottom:14px;background:linear-gradient(135deg,#ffffff 0%,#f8fcff 50%,#f0fdf4 100%)}
+.department-distribution-body{display:grid;grid-template-columns:minmax(240px,340px) minmax(0,1fr);gap:16px;align-items:center}
+.department-donut-wrap{display:flex;align-items:center;justify-content:center;min-height:300px;border:1px solid #dbeafe;background:linear-gradient(135deg,#ffffff 0%,#eff6ff 52%,#ecfdf5 100%);border-radius:4px;padding:10px;box-shadow:inset 0 1px 8px rgba(37,99,235,.06)}
+.department-donut-svg{display:block;width:100%;max-width:320px;height:auto;overflow:visible}
+.department-donut-bg{fill:none}
+.department-donut-segment{filter:drop-shadow(0 3px 4px rgba(15,23,42,.12));transition:filter .16s ease,stroke-width .16s ease}
+.department-donut-segment:hover{filter:drop-shadow(0 7px 10px rgba(15,23,42,.22));stroke-width:38px}
+.department-donut-hole{fill:#fff;filter:drop-shadow(0 4px 12px rgba(15,23,42,.12))}
+.department-donut-total{font-size:22px;fill:#111827;font-weight:900}
+.department-donut-caption{font-size:10px;fill:#64748b;font-weight:900;text-transform:uppercase}
+.department-donut-label{font-size:11px;fill:#111827;font-weight:900;paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}
+.department-ranking-table-wrap{overflow:auto;max-height:318px;border:1px solid #e5e7eb;border-radius:4px;background:#fff}
+.department-ranking-table{width:100%;border-collapse:collapse;font-size:12px}
+.department-ranking-table th{position:sticky;top:0;background:#f8fafc;color:#334155;border-bottom:1px solid #cbd5e1;padding:8px 9px;text-align:left;white-space:nowrap;font-weight:800}
+.department-ranking-table td{border-bottom:1px solid #e5e7eb;padding:8px 9px;color:#1f2937;vertical-align:middle}
+.department-ranking-table tbody tr:nth-child(even) td{background:#fbfdff}
+.department-ranking-table tbody tr.active td{background:#eff6ff!important;box-shadow:inset 0 1px 0 rgba(37,99,235,.08),inset 0 -1px 0 rgba(37,99,235,.08)}
+.department-ranking-table tbody tr.active td:first-child{box-shadow:inset 4px 0 0 #2563eb,inset 0 1px 0 rgba(37,99,235,.08),inset 0 -1px 0 rgba(37,99,235,.08)}
+.department-ranking-table th:not(:first-child):not(:nth-child(2)),.department-ranking-table td:not(:first-child):not(:nth-child(2)){text-align:right}
+.department-rank-chip{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;color:#fff;font-size:11px;font-weight:900;box-shadow:0 0 0 2px rgba(255,255,255,.9),0 1px 4px rgba(15,23,42,.16)}
+.department-rank-name{display:inline-grid;grid-template-columns:10px minmax(0,1fr);align-items:center;gap:8px;min-width:180px;max-width:360px;font-weight:800}
+.department-rank-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 2px rgba(255,255,255,.9)}
+.department-drilldown-button,.department-count-button{appearance:none;border:0;background:transparent;color:#111827;font:inherit;font-weight:900;cursor:pointer}
+.department-drilldown-button{display:inline-grid;grid-template-columns:10px minmax(0,1fr);align-items:center;gap:8px;min-width:180px;max-width:360px;text-align:left}
+.department-count-button{padding:2px 6px;border-radius:4px}
+.department-drilldown-button:hover,.department-count-button:hover{color:#1d4ed8;background:#eff6ff}
+.department-drilldown-button:focus,.department-count-button:focus{outline:2px solid #2563eb;outline-offset:1px}
+.department-employee-detail{border:1px solid #dbeafe;background:#fff;border-radius:4px;margin-top:12px;padding:12px}
+.department-employee-detail-empty{color:#64748b;font-weight:800;text-align:center;padding:14px}
 .panel{background:#fff;border:1px solid #e5e7eb;border-radius:4px;box-shadow:0 1px 4px rgba(15,23,42,.08);padding:14px}
 .panel-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
 .panel h2{font-size:14px;margin:0;color:#111827;font-weight:800}
@@ -2895,8 +3220,16 @@ ${buildDetailTableFilterHtml(rows)}
 .today-role-employee{appearance:none;position:relative;display:block;width:100%;text-align:left;font:inherit;border:1px solid #e5e7eb;background:#fbfdff;border-radius:4px;padding:8px 9px;min-width:0;cursor:pointer}
 .today-role-employee:hover{border-color:#bfdbfe;background:#f8fcff}
 .today-role-employee:focus{outline:2px solid #2563eb;outline-offset:1px}
-.today-role-employee.weekend-login-member{background:#fffbeb;border-color:#fcd34d;box-shadow:inset 4px 0 0 rgba(245,158,11,.56)}
-.today-role-employee.weekend-login-member:hover{background:#fff7d6;border-color:#f59e0b}
+.developer-admin-badge{display:inline-flex;align-items:center;gap:6px;vertical-align:middle;border:1px solid #93c5fd;background:linear-gradient(135deg,#eff6ff 0%,#dbeafe 52%,#ecfdf5 100%);color:#1e3a8a;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:900;line-height:1;box-shadow:0 0 0 2px rgba(37,99,235,.08),0 4px 12px rgba(37,99,235,.16);animation:developerBadgePulse 2.2s ease-in-out infinite}
+.developer-admin-badge.compact{margin-top:6px;padding:3px 7px;font-size:10px}
+.developer-admin-badge small{color:#047857;font-size:10px;font-weight:900}
+.developer-admin-icon{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:999px;background:#ffffff;color:#111827;font-size:16px;font-weight:900;line-height:1;letter-spacing:0;box-shadow:inset 0 0 0 1px rgba(37,99,235,.18),0 1px 5px rgba(37,99,235,.18);animation:developerIconPulse 1.6s ease-in-out infinite}
+.developer-admin-label{white-space:nowrap}
+.today-role-employee.dashboard-developer-member{background:linear-gradient(135deg,#ffffff 0%,#eff6ff 48%,#dcfce7 100%);border-color:#60a5fa;box-shadow:inset 4px 0 0 #2563eb,0 0 0 2px rgba(37,99,235,.08),0 6px 18px rgba(37,99,235,.16);padding-right:12px;animation:developerTilePulse 2.4s ease-in-out infinite}
+.today-role-employee.dashboard-developer-member:hover{background:linear-gradient(135deg,#f8fcff 0%,#dbeafe 52%,#bbf7d0 100%);border-color:#2563eb;animation-play-state:paused}
+.today-role-employee.weekend-login-member{background:#fffbeb;border-color:#fcd34d;box-shadow:inset 4px 0 0 rgba(245,158,11,.56);animation:weekendLoginTilePulse 2.4s ease-in-out infinite}
+.today-role-employee.weekend-login-member:hover{background:#fff7d6;border-color:#f59e0b;animation-play-state:paused}
+.today-role-employee.dashboard-developer-member.weekend-login-member{background:linear-gradient(135deg,#eff6ff 0%,#fff7cc 56%,#dcfce7 100%);border-color:#60a5fa;box-shadow:inset 4px 0 0 #2563eb,0 0 0 2px rgba(37,99,235,.1),0 6px 18px rgba(37,99,235,.16)}
 .today-role-employee.new-login-member{background:#fff7cc;border-color:#f59e0b;box-shadow:inset 4px 0 0 #f59e0b,0 2px 7px rgba(245,158,11,.16);padding-right:48px}
 .today-role-employee.weekend-login-member.new-login-member{background:#fff7cc;border-color:#f59e0b;box-shadow:inset 4px 0 0 #f59e0b,0 2px 7px rgba(245,158,11,.16)}
 .today-role-employee.new-login-member:after{content:'New';position:absolute;top:7px;right:8px;background:#f59e0b;color:#78350f;border-radius:999px;padding:2px 6px;font-size:10px;font-weight:900;line-height:1}
@@ -2904,13 +3237,21 @@ ${buildDetailTableFilterHtml(rows)}
 .today-role-employee a{color:#2563eb;text-decoration:none}
 .today-role-employee a:hover{text-decoration:underline}
 .today-role-employee small{display:block;color:#64748b;font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.weekend-login-badge{display:inline-block;margin-top:6px;border:1px solid #fcd34d;background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 7px;font-size:10px;font-weight:900;line-height:1}
+.table-link+.developer-admin-badge.compact,td>.developer-admin-badge.compact{margin:0 0 0 7px}
+.weekend-login-badge{display:inline-block;margin-top:6px;border:1px solid #fcd34d;background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 7px;font-size:10px;font-weight:900;line-height:1;animation:weekendLoginBadgePulse 1.8s ease-in-out infinite;transform-origin:center}
 .today-role-no-employees{color:#64748b;font-weight:800;padding:8px}
 .employee-popup-backdrop{display:none;position:fixed;z-index:9999;inset:0;background:rgba(15,23,42,.42);align-items:center;justify-content:center;padding:20px}
 .employee-popup{width:min(460px,94vw);background:#fff;border:1px solid #dbeafe;border-radius:6px;box-shadow:0 18px 55px rgba(15,23,42,.28);overflow:hidden}
 .employee-popup-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;background:linear-gradient(135deg,#f8fcff 0%,#eef6ff 100%);border-bottom:1px solid #dbeafe;padding:14px}
 .employee-popup-head h2{font-size:16px;line-height:1.2;margin:0;color:#111827;font-weight:800}
 .employee-popup-head span{display:block;margin-top:4px;color:#64748b;font-size:12px;font-weight:800}
+.employee-popup-head .developer-popup-badge{align-items:center;width:max-content;margin-top:8px;color:#1e3a8a}
+.employee-popup-head .developer-popup-badge span,.employee-popup-head .developer-popup-badge small{margin-top:0}
+.employee-popup-head .developer-popup-badge .developer-admin-badge{display:inline-flex;color:#1e3a8a}
+.employee-popup-head .developer-popup-badge .developer-admin-icon{display:inline-flex;color:#111827}
+.employee-popup-head .developer-popup-badge .developer-admin-label{display:inline;color:#1e3a8a}
+.employee-popup-head .developer-popup-badge small{display:inline;color:#047857}
+.employee-popup-backdrop.dashboard-developer-popup .employee-popup{border-color:#60a5fa;box-shadow:0 20px 60px rgba(37,99,235,.32)}
 .employee-popup-close{width:30px;height:30px;border:1px solid #cbd5e1;background:#fff;border-radius:4px;color:#334155;font-weight:800;cursor:pointer}
 .employee-popup-close:hover{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8}
 .employee-popup-body{padding:12px 14px}
@@ -2937,6 +3278,12 @@ ${buildDetailTableFilterHtml(rows)}
 .axis-label{font-size:10px;fill:#64748b}
 .month-axis-label{font-size:10px;fill:#475569;font-weight:700}
 .bar-total-label{font-size:10px;fill:#334155;font-weight:700;pointer-events:none}
+.monthly-total-line-shadow{fill:none;stroke:#ffffff;stroke-width:7;stroke-linecap:round;stroke-linejoin:round;opacity:.76;pointer-events:none}
+.monthly-total-line{fill:none;stroke:#7c3aed;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+.monthly-total-point{pointer-events:none}
+.monthly-total-point-ring{fill:#ffffff;stroke:#7c3aed;stroke-width:2.1}
+.monthly-total-point-core{fill:#7c3aed}
+.monthly-total-line-legend text{font-size:10px;fill:#4c1d95;font-weight:800}
 .role-legend{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px 0}
 .role-legend-item{display:grid;grid-template-columns:9px auto minmax(72px,1fr);align-items:center;gap:6px;border:1px solid #e5e7eb;background:#fff;border-radius:4px;padding:5px 8px;min-width:150px;max-width:240px;color:#1f2937}
 .role-legend-item:hover{filter:saturate(1.06) brightness(1.01)}
@@ -2964,6 +3311,7 @@ ${buildDetailTableFilterHtml(rows)}
 .role-matrix-count{appearance:none;display:block;box-sizing:border-box;width:100%;border:0;border-radius:4px;padding:4px 8px;min-width:34px;text-align:center;font:inherit;font-weight:800;line-height:1.2;cursor:pointer}
 .role-matrix-count:hover{filter:saturate(1.08) brightness(1.03);box-shadow:inset 0 0 0 1px #10b981,0 1px 4px rgba(16,185,129,.18)!important}
 .role-matrix-count.active{background:#fde68a!important;color:#78350f!important;box-shadow:inset 0 0 0 1px #f59e0b,0 0 0 2px #fef3c7!important}
+.role-matrix-count.highest-value{position:relative;background:linear-gradient(135deg,#dcfce7 0%,#86efac 50%,#22c55e 100%)!important;color:#064e3b!important;box-shadow:inset 0 0 0 1px rgba(21,128,61,.32),0 0 0 3px rgba(34,197,94,.2),0 5px 12px rgba(34,197,94,.18)!important;animation:highestMatrixValuePulse 1.9s ease-in-out infinite}
 .role-matrix-count:focus{outline:2px solid #2563eb;outline-offset:1px}
 .role-swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;vertical-align:middle}
 .detail-filter-bar{display:grid;grid-template-columns:minmax(220px,1.3fr) minmax(180px,1fr) minmax(150px,.75fr) minmax(160px,.75fr) auto;gap:10px;align-items:end;margin:10px 0 12px 0;padding:10px;border:1px solid #e5e7eb;background:#fbfdff;border-radius:4px}
@@ -2986,19 +3334,30 @@ ${buildDetailTableFilterHtml(rows)}
 .result-table td{border-bottom:1px solid #e5e7eb;padding:9px 10px;vertical-align:top;color:#1f2937}
 .result-table tbody tr:nth-child(even) td{background:#fbfdff}
 .result-table tr.weekend-login-row td{background:#fffbeb;box-shadow:inset 0 1px 0 rgba(245,158,11,.08),inset 0 -1px 0 rgba(245,158,11,.08)}
-.result-table tr.weekend-login-row td:first-child{box-shadow:inset 4px 0 0 rgba(245,158,11,.58),inset 0 1px 0 rgba(245,158,11,.08),inset 0 -1px 0 rgba(245,158,11,.08)}
+.result-table tr.weekend-login-row td:first-child{box-shadow:inset 4px 0 0 rgba(245,158,11,.58),inset 0 1px 0 rgba(245,158,11,.08),inset 0 -1px 0 rgba(245,158,11,.08);animation:weekendLoginRowPulse 2.4s ease-in-out infinite}
 .result-table tr:hover td{background:#f8fafc}
 .result-table tr.weekend-login-row:hover td{background:#fff7d6}
 .table-link{color:#2563eb;font-weight:800;text-decoration:none}
 .table-link:hover{text-decoration:underline}
-.weekend-login-table-badge{display:inline-block;margin-left:8px;border:1px solid #fcd34d;background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 7px;font-size:10px;font-weight:900;line-height:1;vertical-align:middle}
+.weekend-login-table-badge{display:inline-block;margin-left:8px;border:1px solid #fcd34d;background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 7px;font-size:10px;font-weight:900;line-height:1;vertical-align:middle;animation:weekendLoginBadgePulse 1.8s ease-in-out infinite;transform-origin:center}
+@keyframes weekendLoginTilePulse{0%,100%{box-shadow:inset 4px 0 0 rgba(245,158,11,.56)}50%{box-shadow:inset 4px 0 0 #f59e0b,0 0 0 3px rgba(245,158,11,.22),0 6px 18px rgba(245,158,11,.16)}}
+@keyframes weekendLoginBadgePulse{0%,100%{transform:scale(1);box-shadow:0 0 0 0 rgba(245,158,11,.34)}50%{transform:scale(1.06);box-shadow:0 0 0 4px rgba(245,158,11,0)}}
+@keyframes weekendLoginRowPulse{0%,100%{box-shadow:inset 4px 0 0 rgba(245,158,11,.58),inset 0 1px 0 rgba(245,158,11,.08),inset 0 -1px 0 rgba(245,158,11,.08)}50%{box-shadow:inset 6px 0 0 #f59e0b,inset 0 1px 0 rgba(245,158,11,.16),inset 0 -1px 0 rgba(245,158,11,.16),0 0 0 2px rgba(245,158,11,.16)}}
+@keyframes developerTilePulse{0%,100%{box-shadow:inset 4px 0 0 #2563eb,0 0 0 2px rgba(37,99,235,.08),0 6px 18px rgba(37,99,235,.16)}50%{box-shadow:inset 6px 0 0 #1d4ed8,0 0 0 4px rgba(37,99,235,.12),0 10px 24px rgba(37,99,235,.24)}}
+@keyframes developerBadgePulse{0%,100%{transform:translateY(0);box-shadow:0 0 0 2px rgba(37,99,235,.08),0 4px 12px rgba(37,99,235,.16)}50%{transform:translateY(-1px);box-shadow:0 0 0 4px rgba(37,99,235,.1),0 8px 18px rgba(37,99,235,.24)}}
+@keyframes developerIconPulse{0%,100%{transform:scale(1);box-shadow:inset 0 0 0 1px rgba(37,99,235,.18),0 1px 5px rgba(37,99,235,.18)}50%{transform:scale(1.08);box-shadow:inset 0 0 0 1px rgba(4,120,87,.22),0 0 0 3px rgba(37,99,235,.1),0 4px 10px rgba(4,120,87,.2)}}
+@keyframes highestMatrixValuePulse{0%,100%{transform:scale(1);box-shadow:inset 0 0 0 1px rgba(21,128,61,.32),0 0 0 3px rgba(34,197,94,.2),0 5px 12px rgba(34,197,94,.18)}50%{transform:scale(1.07);box-shadow:inset 0 0 0 1px rgba(21,128,61,.46),0 0 0 6px rgba(34,197,94,.08),0 9px 18px rgba(34,197,94,.3)}}
+@media(prefers-reduced-motion:reduce){.today-role-employee.weekend-login-member,.today-role-employee.dashboard-developer-member,.developer-admin-badge,.developer-admin-icon,.weekend-login-badge,.weekend-login-table-badge,.result-table tr.weekend-login-row td:first-child,.role-matrix-count.highest-value{animation:none!important}}
 .status-pill{display:inline-block;border-radius:999px;padding:4px 9px;font-weight:800;font-size:11px}
 .status-pill.success{background:#ccfbf1;color:#115e59}
 .status-pill.failed{background:#ffedd5;color:#9a3412}
 .status-pill.unknown{background:#e2e8f0;color:#334155}
 .empty-chart{height:160px;display:flex;align-items:center;justify-content:center;color:#64748b;font-weight:700;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:4px}
 .dash-footer{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:14px;padding:12px 2px 0;border-top:1px solid #e5e7eb;color:#64748b;font-size:12px;font-weight:700}
+.developer-credit{display:inline-flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.developer-credit strong{color:#111827;font-weight:900}
 .version-badge{background:#eef2ff;border:1px solid #dbeafe;color:#334155;border-radius:999px;padding:3px 8px;font-weight:800}
+@media(max-width:900px){.department-distribution-body{grid-template-columns:1fr}.department-donut-wrap{min-height:260px}.department-ranking-table-wrap{max-height:360px}}
 @media(max-width:1100px){.kpi-grid{grid-template-columns:repeat(2,1fr)}.detail-filter-bar{grid-template-columns:repeat(2,minmax(180px,1fr))}}
 @media(max-width:760px){.dash-topbar{align-items:flex-start;flex-direction:column}.dash-actions{width:100%;flex-direction:column;align-items:stretch}.auto-refresh-toggle,.auto-refresh-frequency{width:100%;box-sizing:border-box}.auto-refresh-status{min-width:0}.btn{width:100%}.kpi-grid{grid-template-columns:1fr}.detail-filter-bar{grid-template-columns:1fr}.detail-filter-actions,.role-matrix-actions{width:100%;align-items:stretch;flex-direction:column}.today-role-detail-head,.role-matrix-head{align-items:flex-start;flex-direction:column}.dash-footer{justify-content:flex-start}}
 </style>`;

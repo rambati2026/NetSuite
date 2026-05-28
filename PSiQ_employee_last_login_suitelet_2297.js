@@ -16,10 +16,11 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
   const CONFIG = {
     dashboardTitle: 'Employee Last Login Monitor',
     developedBy: 'Rama Ambati',
-    version: '1.6.32',
+    version: '1.6.37',
     developerTitle: 'NetSuite Administrator',
     developerEmployeeNames: ['Rama Ambati', 'Ramakrishna Ambati'],
     developerEmployeeEmails: ['rambati@psiquantum.com'],
+    serviceAccountEmailDomains: ['netsuite.com', 'oracle.com', 'kainos.com', 'suitesoftware.com', 'tradecentric.com'],
     allowedAccounts: ['5775522', '5775522_SB1', '5775522_SB2'],
     pageSize: 1000,
     summaryRowLimit: 10000,
@@ -173,6 +174,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     if (!prefix) return true;
 
     return normalizedRoleName.indexOf(prefix) === 0;
+  }
+
+  function isAdministratorRole(roleName) {
+    return String(roleName || '').trim().toLowerCase() === 'administrator';
   }
 
   function getEmployeeLoginData(filters) {
@@ -1159,6 +1164,15 @@ ${buildCss()}
     </span>`;
   }
 
+  function buildServiceAccountBadgeHtml(compact) {
+    const className = compact ? 'service-account-badge compact' : 'service-account-badge';
+
+    return `<span class="${className}" title="Service Account">
+      <span class="service-account-icon" aria-hidden="true">SA</span>
+      <span class="service-account-label">Service Account</span>
+    </span>`;
+  }
+
   function isDashboardDeveloperEmployee(employee) {
     const name = normalizeDeveloperMatchText(employee && employee.name);
     const email = normalizeDeveloperMatchText(employee && employee.email);
@@ -1166,6 +1180,26 @@ ${buildCss()}
     const emails = (CONFIG.developerEmployeeEmails || []).map(normalizeDeveloperMatchText);
 
     return (name && names.indexOf(name) >= 0) || (email && emails.indexOf(email) >= 0);
+  }
+
+  function isServiceAccountEmployee(employee) {
+    return isServiceAccountEmail(employee && employee.email);
+  }
+
+  function isServiceAccountEmail(email) {
+    const text = String(email || '').trim().toLowerCase();
+    const domains = (CONFIG.serviceAccountEmailDomains || []).map(domain => String(domain || '').trim().toLowerCase());
+
+    if (text.indexOf('@') < 0) return false;
+
+    return domains.indexOf(text.split('@').pop()) >= 0;
+  }
+
+  function buildEmployeeEmailHtml(employee) {
+    const email = String(employee && employee.email ? employee.email : '');
+    if (!email) return '';
+
+    return esc(email) + (isServiceAccountEmployee(employee) ? buildServiceAccountBadgeHtml(true) : '');
   }
 
   function normalizeDeveloperMatchText(value) {
@@ -1273,13 +1307,14 @@ ${buildCss()}
 
   function buildKpiEmployeeTableRowHtml(row) {
     const status = getEmployeeStatus(row);
+    const roleName = row.roleName || 'No successful login role';
 
     return `
 <tr>
   <td data-export-label="${escAttr(row.name || '')}">${buildEmployeeLink(row)}</td>
-  <td>${esc(row.email)}</td>
+  <td data-export-label="${escAttr(row.email || '')}">${buildEmployeeEmailHtml(row)}</td>
   <td>${esc(getDepartmentName(row))}</td>
-  <td>${esc(row.roleName || 'No successful login role')}</td>
+  <td>${buildRoleNameHtml(roleName)}</td>
   <td>${esc(row.lastLogin || 'Never logged in')}</td>
   <td>${esc(row.loginAgeLabel)}</td>
   <td><span class="status-pill ${escAttr(status.className)}">${esc(status.text)}</span></td>
@@ -1662,13 +1697,14 @@ ${buildCss()}
       const countInside = barWidth > 48;
       const countX = countInside ? left + barWidth - 10 : Math.min(width - right + 44, left + barWidth + 10);
       const countClass = countInside ? 'today-role-count inside' : 'today-role-count';
+      const administratorRole = isAdministratorRole(role.roleName);
 
       return `
-      <g class="today-role-row" data-role-index="${index}" role="button" tabindex="0" focusable="true" onclick="showTodayRoleEmployees(${index})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showTodayRoleEmployees(${index});}">
-        <text x="${left - 16}" y="${roundSvgNumber(y + 22)}" text-anchor="end" class="today-role-row-label">
+      <g class="today-role-row${administratorRole ? ' administrator-role-row' : ''}" data-role-index="${index}" role="button" tabindex="0" focusable="true" onclick="showTodayRoleEmployees(${index})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showTodayRoleEmployees(${index});}">
+        <text x="${left - 16}" y="${roundSvgNumber(y + 22)}" text-anchor="end" class="today-role-row-label${administratorRole ? ' administrator-role-svg-label' : ''}">
           <title>${escAttr(role.roleName)}</title>${esc(label)}
         </text>
-        <rect x="${left}" y="${roundSvgNumber(barY)}" width="${roundSvgNumber(barWidth)}" height="${barHeight}" rx="5" class="today-role-bar" fill="${escAttr(role.color)}">
+        <rect x="${left}" y="${roundSvgNumber(barY)}" width="${roundSvgNumber(barWidth)}" height="${barHeight}" rx="5" class="today-role-bar${administratorRole ? ' administrator-role-bar' : ''}" fill="${escAttr(role.color)}">
           <title>${escAttr(role.roleName)}: ${escAttr(value)} employee(s) today</title>
         </rect>
         <text x="${roundSvgNumber(countX)}" y="${roundSvgNumber(y + 22)}" text-anchor="${countInside ? 'end' : 'start'}" class="${countClass}">${esc(value)}</text>
@@ -1719,7 +1755,7 @@ ${buildCss()}
 <div class="today-role-employee-list" id="${panelId}" data-export-title="${escAttr(exportTitle)}" data-export-period="${escAttr(trend.dateLabel || 'Today')}" data-export-role="${escAttr(role.roleName)}" style="display:none">
   <div class="today-role-detail-head">
     <div>
-      <b>${esc(role.roleName)}</b>
+      <b>${buildRoleNameHtml(role.roleName)}</b>
       <span>${esc(formatWholeNumber(role.count))} employee(s) logged in today</span>
     </div>
     <button type="button" class="btn btn-small" onclick="exportEmployeePanelCsv('${panelId}')">Export CSV</button>
@@ -1738,11 +1774,14 @@ ${buildCss()}
       name,
       email: employee.email
     });
+    const serviceAccount = isServiceAccountEmployee({
+      email: employee.email
+    });
 
     return `
-<button type="button" class="today-role-employee employee-export-row${weekendLogin ? ' weekend-login-member' : ''}${dashboardDeveloper ? ' dashboard-developer-member' : ''}" data-employee-id="${escAttr(employee.id || employee.email || name)}" data-employee-name="${escAttr(name)}" data-employee-email="${escAttr(employee.email || '')}" data-employee-department="${escAttr(employee.department || 'No Department')}" data-employee-last-login="${escAttr(employee.lastLogin || 'Not available')}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-weekend-login-label="${escAttr(weekendLogin ? weekendLabel : '')}" data-dashboard-developer="${dashboardDeveloper ? 'T' : 'F'}" data-employee-url="${escAttr(employee.employeeUrl || '')}" onclick="openEmployeeLoginPopup(this)">
+<button type="button" class="today-role-employee employee-export-row${weekendLogin ? ' weekend-login-member' : ''}${dashboardDeveloper ? ' dashboard-developer-member' : ''}${serviceAccount ? ' service-account-member' : ''}" data-employee-id="${escAttr(employee.id || employee.email || name)}" data-employee-name="${escAttr(name)}" data-employee-email="${escAttr(employee.email || '')}" data-employee-department="${escAttr(employee.department || 'No Department')}" data-employee-last-login="${escAttr(employee.lastLogin || 'Not available')}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-weekend-login-label="${escAttr(weekendLogin ? weekendLabel : '')}" data-dashboard-developer="${dashboardDeveloper ? 'T' : 'F'}" data-service-account="${serviceAccount ? 'T' : 'F'}" data-employee-url="${escAttr(employee.employeeUrl || '')}" onclick="openEmployeeLoginPopup(this)">
   <b>${esc(name)}</b>
-  ${employee.email ? `<small>${esc(employee.email)}</small>` : ''}
+  ${employee.email ? `<small>${buildEmployeeEmailHtml({ email: employee.email })}</small>` : ''}
   ${dashboardDeveloper ? buildDeveloperAdminBadgeHtml(true) : ''}
   ${weekendLogin ? `<span class="weekend-login-badge">${esc(weekendLabel)}</span>` : ''}
 </button>`;
@@ -1757,6 +1796,7 @@ ${buildCss()}
         <h2 id="employeePopupName">Employee Login Detail</h2>
         <span id="employeePopupEmail"></span>
         <span id="employeePopupDeveloperBadge" class="developer-popup-badge" style="display:none">${buildDeveloperAdminBadgeHtml(false)}</span>
+        <span id="employeePopupServiceAccountBadge" class="service-account-popup-badge" style="display:none">${buildServiceAccountBadgeHtml(false)}</span>
       </div>
       <button type="button" class="employee-popup-close" onclick="closeEmployeeLoginPopup()" aria-label="Close employee detail">x</button>
     </div>
@@ -1949,7 +1989,7 @@ ${buildCss()}
 <div class="monthly-role-employee-list" id="${panelId}" data-export-title="${escAttr(exportTitle)}" data-export-period="${escAttr(month.title)}" data-export-role="${escAttr(role.roleName)}" style="display:none">
   <div class="today-role-detail-head">
     <div>
-      <b>${esc(role.roleName)}</b>
+      <b>${buildRoleNameHtml(role.roleName)}</b>
       <span>${esc(formatWholeNumber(count))} employee(s) logged in during ${esc(month.title)}</span>
     </div>
     <button type="button" class="btn btn-small" onclick="exportEmployeePanelCsv('${panelId}')">Export CSV</button>
@@ -1962,10 +2002,10 @@ ${buildCss()}
 
   function buildMonthlyRoleLegendHtml(roles) {
     return `<div class="role-legend">${roles.map(role => `
-      <span class="role-legend-item" style="${escAttr(getRoleLegendTileStyle(role.color))}" title="${escAttr(role.roleName + ': ' + formatWholeNumber(role.total) + ' employee-month total')}">
+      <span class="role-legend-item${isAdministratorRole(role.roleName) ? ' administrator-role-legend' : ''}" style="${escAttr(getRoleLegendTileStyle(role.color))}" title="${escAttr(role.roleName + ': ' + formatWholeNumber(role.total) + ' employee-month total')}">
         <span class="role-legend-dot" style="background:${escAttr(role.color)}"></span>
         <small>${esc(formatWholeNumber(role.total))}</small>
-        <b>${esc(truncateText(role.roleName, 34))}</b>
+        <b>${buildRoleTextHtml(truncateText(role.roleName, 34), role.roleName)}</b>
       </span>`).join('')}</div>`;
   }
 
@@ -1975,11 +2015,26 @@ ${buildCss()}
 
   function buildRoleTileLabelHtml(label, roleColor) {
     const color = normalizeHexColor(roleColor, '#64748b');
+    const administratorRole = isAdministratorRole(label);
 
-    return `<span class="role-tile-label" style="${escAttr(getRoleTileStyle(color, 0.04, 0.14, 0.2, 3, 0.28))}">
+    return `<span class="role-tile-label${administratorRole ? ' administrator-role-tile' : ''}" style="${escAttr(getRoleTileStyle(color, 0.04, 0.14, 0.2, 3, 0.28))}">
       <span class="role-tile-dot" style="background:${escAttr(color)}"></span>
-      <span class="role-tile-text">${esc(label)}</span>
+      <span class="role-tile-text">${buildRoleTextHtml(label, label)}</span>
     </span>`;
+  }
+
+  function buildRoleNameHtml(roleName) {
+    const label = String(roleName || 'No successful login role');
+
+    return isAdministratorRole(label) ?
+      `<span class="administrator-role-badge" title="Administrator role">${esc(label)}</span>` :
+      esc(label);
+  }
+
+  function buildRoleTextHtml(label, roleName) {
+    return isAdministratorRole(roleName || label) ?
+      `<span class="administrator-role-text">${esc(label)}</span>` :
+      esc(label);
   }
 
   function getRoleTileStyle(roleColor, startMix, endMix, borderMix, stripeWidth, stripeOpacity) {
@@ -2237,6 +2292,7 @@ ${buildDetailTableFilterHtml(rows)}
   </label>
   <div class="detail-filter-actions">
     <span id="employeeLoginVisibleCount">${esc(formatWholeNumber(rows.length))} of ${esc(formatWholeNumber(rows.length))} shown</span>
+    <button type="button" class="btn btn-small btn-primary" onclick="exportEmployeeLoginCsv()">Export CSV</button>
     <button type="button" class="btn btn-small" onclick="clearEmployeeLoginFilters()">Clear</button>
   </div>
 </div>`;
@@ -2270,9 +2326,9 @@ ${buildDetailTableFilterHtml(rows)}
     return `
 <tr class="${weekendLogin ? 'weekend-login-row' : ''}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-detail-search="${escAttr(searchText)}" data-role="${escAttr(roleName)}" data-status="${escAttr(status.className)}" data-login-state="${row.lastLoginDate ? 'logged' : 'never'}" data-stale="${row.stale ? 'T' : 'F'}" data-days="${escAttr(row.daysSinceLogin === null ? '' : row.daysSinceLogin)}" data-sort-employee="${escAttr(row.name || '')}" data-sort-last-login="${escAttr(lastLoginTime)}" data-sort-role="${escAttr(roleName)}" data-sort-days="${escAttr(daysSortValue)}" data-sort-status="${escAttr(status.text)}">
   <td data-export-label="${escAttr(row.name || '')}">${buildEmployeeLink(row)}</td>
-  <td>${esc(row.email)}</td>
+  <td data-export-label="${escAttr(row.email || '')}">${buildEmployeeEmailHtml(row)}</td>
   <td data-sort-value="${escAttr(lastLoginTime)}" data-export-label="${escAttr(row.lastLogin || 'Never logged in')}">${esc(row.lastLogin || 'Never logged in')}${weekendLogin ? `<span class="weekend-login-table-badge">${esc(weekendLoginLabel)}</span>` : ''}</td>
-  <td>${esc(roleName)}</td>
+  <td>${buildRoleNameHtml(roleName)}</td>
   <td>${esc(row.loginAgeLabel)}</td>
   <td><span class="status-pill ${escAttr(status.className)}">${esc(status.text)}</span></td>
 </tr>`;
@@ -2921,28 +2977,41 @@ ${buildDetailTableFilterHtml(rows)}
     var weekendLogin = employee.getAttribute('data-weekend-login') === 'T';
     var weekendLoginLabel = employee.getAttribute('data-weekend-login-label') || 'Weekend';
     var dashboardDeveloper = employee.getAttribute('data-dashboard-developer') === 'T';
+    var serviceAccount = employee.getAttribute('data-service-account') === 'T' ||
+      /@(netsuite|oracle)\\.com$/i.test(email);
     var employeeUrl = employee.getAttribute('data-employee-url') || '';
     var role = panel ? (panel.getAttribute('data-export-role') || '') : '';
     var period = panel ? (panel.getAttribute('data-export-period') || '') : '';
     var recordLink = document.getElementById('employeePopupRecordLink');
     var developerBadge = document.getElementById('employeePopupDeveloperBadge');
+    var serviceAccountBadge = document.getElementById('employeePopupServiceAccountBadge');
 
     setPopupText('employeePopupName', name);
     setPopupText('employeePopupEmail', email);
     setPopupText('employeePopupDepartment', department);
     setPopupText('employeePopupLastLogin', lastLogin);
     setPopupText('employeePopupWeekendLogin', weekendLogin ? weekendLoginLabel : 'No');
-    setPopupText('employeePopupRole', role || 'Not available');
+    setPopupRole(role || 'Not available');
     setPopupText('employeePopupPeriod', period || 'Not available');
 
     if(developerBadge){
       developerBadge.style.display = dashboardDeveloper ? 'inline-flex' : 'none';
     }
 
+    if(serviceAccountBadge){
+      serviceAccountBadge.style.display = serviceAccount ? 'inline-flex' : 'none';
+    }
+
     if(dashboardDeveloper){
       popup.classList.add('dashboard-developer-popup');
     } else {
       popup.classList.remove('dashboard-developer-popup');
+    }
+
+    if(serviceAccount){
+      popup.classList.add('service-account-popup');
+    } else {
+      popup.classList.remove('service-account-popup');
     }
 
     if(recordLink){
@@ -2973,6 +3042,29 @@ ${buildDetailTableFilterHtml(rows)}
   function setPopupText(id, text){
     var node = document.getElementById(id);
     if(node) node.textContent = text || '';
+  }
+
+  function setPopupRole(role){
+    var node = document.getElementById('employeePopupRole');
+    var text = role || 'Not available';
+    if(!node) return;
+
+    node.textContent = '';
+
+    if(isPopupAdministratorRole(text)){
+      var badge = document.createElement('span');
+      badge.className = 'administrator-role-badge';
+      badge.title = 'Administrator role';
+      badge.textContent = text;
+      node.appendChild(badge);
+      return;
+    }
+
+    node.textContent = text;
+  }
+
+  function isPopupAdministratorRole(role){
+    return String(role || '').replace(/\\s+/g, ' ').trim().toLowerCase() === 'administrator';
   }
 
   function initEmployeeLoginPopupEvents(){
@@ -3211,11 +3303,14 @@ ${buildDetailTableFilterHtml(rows)}
 .today-role-count.inside{fill:#ffffff}
 .today-role-legend-dot{fill:#20c997}
 .today-role-legend{font-size:12px;fill:#334155;font-weight:800}
-.today-role-detail{border:1px solid #dbeafe;background:#fff;border-radius:4px;margin-top:10px;padding:12px}
+.today-role-detail{border:1px solid #dbeafe;background:linear-gradient(135deg,#ffffff 0%,#f8fcff 46%,#fff7ed 100%);border-radius:4px;margin-top:10px;padding:12px}
 .today-role-detail-empty{color:#64748b;font-weight:800;text-align:center;padding:14px}
 .today-role-detail-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
 .today-role-detail-head b{display:block;color:#111827;font-size:13px}
 .today-role-detail-head span{display:block;color:#64748b;font-size:12px;font-weight:800;margin-top:2px}
+.today-role-employee-list,.monthly-role-employee-list{position:relative;overflow:hidden;border:1px solid #dbeafe;border-radius:4px;padding:12px;background:linear-gradient(135deg,#f8fcff 0%,#eef6ff 38%,#ecfdf5 68%,#fff7ed 100%);box-shadow:inset 0 1px 12px rgba(37,99,235,.06)}
+.today-role-employee-list:before,.monthly-role-employee-list:before{content:'';position:absolute;inset:0;background:repeating-linear-gradient(135deg,rgba(37,99,235,.05) 0,rgba(37,99,235,.05) 1px,transparent 1px,transparent 18px);pointer-events:none}
+.today-role-employee-list>*,.monthly-role-employee-list>*{position:relative}
 .today-role-employee-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px}
 .today-role-employee{appearance:none;position:relative;display:block;width:100%;text-align:left;font:inherit;border:1px solid #e5e7eb;background:#fbfdff;border-radius:4px;padding:8px 9px;min-width:0;cursor:pointer}
 .today-role-employee:hover{border-color:#bfdbfe;background:#f8fcff}
@@ -3225,6 +3320,10 @@ ${buildDetailTableFilterHtml(rows)}
 .developer-admin-badge small{color:#047857;font-size:10px;font-weight:900}
 .developer-admin-icon{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:999px;background:#ffffff;color:#111827;font-size:16px;font-weight:900;line-height:1;letter-spacing:0;box-shadow:inset 0 0 0 1px rgba(37,99,235,.18),0 1px 5px rgba(37,99,235,.18);animation:developerIconPulse 1.6s ease-in-out infinite}
 .developer-admin-label{white-space:nowrap}
+.service-account-badge{display:inline-flex;align-items:center;gap:5px;vertical-align:middle;border:1px solid #fbbf24;background:#fffbeb;color:#92400e;border-radius:999px;padding:3px 8px;font-size:10px;font-weight:900;line-height:1;box-shadow:0 0 0 2px rgba(245,158,11,.08)}
+.service-account-badge.compact{margin-left:7px;padding:2px 7px;font-size:10px}
+.service-account-icon{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:16px;border-radius:999px;background:#f59e0b;color:#78350f;font-size:9px;font-weight:900;letter-spacing:0}
+.service-account-label{white-space:nowrap}
 .today-role-employee.dashboard-developer-member{background:linear-gradient(135deg,#ffffff 0%,#eff6ff 48%,#dcfce7 100%);border-color:#60a5fa;box-shadow:inset 4px 0 0 #2563eb,0 0 0 2px rgba(37,99,235,.08),0 6px 18px rgba(37,99,235,.16);padding-right:12px;animation:developerTilePulse 2.4s ease-in-out infinite}
 .today-role-employee.dashboard-developer-member:hover{background:linear-gradient(135deg,#f8fcff 0%,#dbeafe 52%,#bbf7d0 100%);border-color:#2563eb;animation-play-state:paused}
 .today-role-employee.weekend-login-member{background:#fffbeb;border-color:#fcd34d;box-shadow:inset 4px 0 0 rgba(245,158,11,.56);animation:weekendLoginTilePulse 2.4s ease-in-out infinite}
@@ -3251,7 +3350,13 @@ ${buildDetailTableFilterHtml(rows)}
 .employee-popup-head .developer-popup-badge .developer-admin-icon{display:inline-flex;color:#111827}
 .employee-popup-head .developer-popup-badge .developer-admin-label{display:inline;color:#1e3a8a}
 .employee-popup-head .developer-popup-badge small{display:inline;color:#047857}
+.employee-popup-head .service-account-popup-badge{align-items:center;width:max-content;margin-top:8px;color:#92400e}
+.employee-popup-head .service-account-popup-badge span{margin-top:0}
+.employee-popup-head .service-account-popup-badge .service-account-badge{display:inline-flex;color:#92400e}
+.employee-popup-head .service-account-popup-badge .service-account-icon{display:inline-flex;color:#78350f}
+.employee-popup-head .service-account-popup-badge .service-account-label{display:inline;color:#92400e}
 .employee-popup-backdrop.dashboard-developer-popup .employee-popup{border-color:#60a5fa;box-shadow:0 20px 60px rgba(37,99,235,.32)}
+.employee-popup-backdrop.service-account-popup .employee-popup{border-color:#fbbf24;box-shadow:0 20px 60px rgba(245,158,11,.26)}
 .employee-popup-close{width:30px;height:30px;border:1px solid #cbd5e1;background:#fff;border-radius:4px;color:#334155;font-weight:800;cursor:pointer}
 .employee-popup-close:hover{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8}
 .employee-popup-body{padding:12px 14px}
@@ -3294,6 +3399,11 @@ ${buildDetailTableFilterHtml(rows)}
 .role-tile-label:hover{filter:saturate(1.03) brightness(1.01)}
 .role-tile-dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 2px rgba(255,255,255,.9)}
 .role-tile-text{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.administrator-role-badge{display:inline-flex;align-items:center;vertical-align:middle;border:1px solid #f59e0b;background:linear-gradient(135deg,#fff7ed 0%,#fef3c7 48%,#dbeafe 100%);color:#7c2d12;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:900;line-height:1;box-shadow:0 0 0 2px rgba(245,158,11,.12),0 2px 8px rgba(245,158,11,.16);animation:administratorRolePulse 1.8s ease-in-out infinite}
+.administrator-role-text{display:inline-block;color:#b45309;font-weight:900;animation:administratorRoleTextPulse 1.8s ease-in-out infinite}
+.administrator-role-tile,.administrator-role-legend{animation:administratorRolePulse 1.8s ease-in-out infinite}
+.administrator-role-svg-label{fill:#b45309!important;animation:administratorRoleSvgTextPulse 1.8s ease-in-out infinite}
+.administrator-role-bar{stroke:#f59e0b;stroke-width:2;animation:administratorRoleBarPulse 1.8s ease-in-out infinite}
 .role-matrix td:first-child .role-tile-label{width:100%;min-width:230px}
 .kpi-role-summary-table .role-tile-label{min-width:190px}
 .monthly-role-detail{border:1px solid #dbeafe;background:#fff;border-radius:4px;margin-top:10px;padding:12px}
@@ -3347,7 +3457,11 @@ ${buildDetailTableFilterHtml(rows)}
 @keyframes developerBadgePulse{0%,100%{transform:translateY(0);box-shadow:0 0 0 2px rgba(37,99,235,.08),0 4px 12px rgba(37,99,235,.16)}50%{transform:translateY(-1px);box-shadow:0 0 0 4px rgba(37,99,235,.1),0 8px 18px rgba(37,99,235,.24)}}
 @keyframes developerIconPulse{0%,100%{transform:scale(1);box-shadow:inset 0 0 0 1px rgba(37,99,235,.18),0 1px 5px rgba(37,99,235,.18)}50%{transform:scale(1.08);box-shadow:inset 0 0 0 1px rgba(4,120,87,.22),0 0 0 3px rgba(37,99,235,.1),0 4px 10px rgba(4,120,87,.2)}}
 @keyframes highestMatrixValuePulse{0%,100%{transform:scale(1);box-shadow:inset 0 0 0 1px rgba(21,128,61,.32),0 0 0 3px rgba(34,197,94,.2),0 5px 12px rgba(34,197,94,.18)}50%{transform:scale(1.07);box-shadow:inset 0 0 0 1px rgba(21,128,61,.46),0 0 0 6px rgba(34,197,94,.08),0 9px 18px rgba(34,197,94,.3)}}
-@media(prefers-reduced-motion:reduce){.today-role-employee.weekend-login-member,.today-role-employee.dashboard-developer-member,.developer-admin-badge,.developer-admin-icon,.weekend-login-badge,.weekend-login-table-badge,.result-table tr.weekend-login-row td:first-child,.role-matrix-count.highest-value{animation:none!important}}
+@keyframes administratorRolePulse{0%,100%{transform:translateY(0);box-shadow:0 0 0 2px rgba(245,158,11,.12),0 2px 8px rgba(245,158,11,.16)}50%{transform:translateY(-1px);box-shadow:0 0 0 5px rgba(245,158,11,.08),0 7px 16px rgba(245,158,11,.28)}}
+@keyframes administratorRoleTextPulse{0%,100%{color:#92400e;text-shadow:0 0 0 rgba(245,158,11,0)}50%{color:#b45309;text-shadow:0 0 8px rgba(245,158,11,.38)}}
+@keyframes administratorRoleSvgTextPulse{0%,100%{fill:#92400e}50%{fill:#f59e0b}}
+@keyframes administratorRoleBarPulse{0%,100%{filter:drop-shadow(0 4px 7px rgba(15,23,42,.18))}50%{filter:drop-shadow(0 7px 14px rgba(245,158,11,.42))}}
+@media(prefers-reduced-motion:reduce){.today-role-employee.weekend-login-member,.today-role-employee.dashboard-developer-member,.developer-admin-badge,.developer-admin-icon,.weekend-login-badge,.weekend-login-table-badge,.result-table tr.weekend-login-row td:first-child,.role-matrix-count.highest-value,.administrator-role-badge,.administrator-role-text,.administrator-role-tile,.administrator-role-legend,.administrator-role-svg-label,.administrator-role-bar{animation:none!important}}
 .status-pill{display:inline-block;border-radius:999px;padding:4px 9px;font-weight:800;font-size:11px}
 .status-pill.success{background:#ccfbf1;color:#115e59}
 .status-pill.failed{background:#ffedd5;color:#9a3412}

@@ -13,57 +13,90 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
   url,
   format
 ) => {
+  // Central dashboard configuration. Keeping these values in one object makes it
+  // easier to tune row limits, chart size, security, and display metadata without
+  // hunting through the rendering/search code.
   const CONFIG = {
+    // Display metadata shown in the Suitelet page and footer.
     dashboardTitle: 'Employee Last Login Monitor',
     developedBy: 'Rama Ambati',
     version: '1.6.37',
     developerTitle: 'NetSuite Administrator',
+    // Used to highlight the dashboard developer in employee lists and popups.
     developerEmployeeNames: ['Rama Ambati', 'Ramakrishna Ambati'],
     developerEmployeeEmails: ['rambati@psiquantum.com'],
+    // Domains treated as service accounts so automation/vendor accounts can be
+    // visually distinguished from ordinary employees.
     serviceAccountEmailDomains: ['netsuite.com', 'oracle.com', 'kainos.com', 'suitesoftware.com', 'tradecentric.com'],
+    // Account allowlist prevents this monitoring dashboard from running after an
+    // accidental deployment to the wrong NetSuite account.
     allowedAccounts: ['5775522', '5775522_SB1', '5775522_SB2'],
+    // NetSuite paged searches support a maximum page size of 1000; the helper
+    // clamps this value before using it.
     pageSize: 1000,
+    // Governance/safety limits for summary searches. The dashboard shows warnings
+    // when a search hits one of these caps.
     summaryRowLimit: 10000,
     todaySummaryRowLimit: 50000,
     monthlySummaryRowLimit: 50000,
+    // Employees at or beyond this many days since login are marked stale.
     staleDaysDefault: 90,
+    // Maximum role rows displayed before lower-volume roles are grouped into
+    // "Other PSiQ/Admin Roles".
     todayRoleLimit: 60,
+    // Monthly chart defaults and role limits.
     monthlyChartMonthsDefault: 12,
     monthlyChartRoleLimit: 5,
     monthlyRoleLimit: 60,
+    // Chart role filtering intentionally focuses on PSiQ-prefixed roles plus
+    // explicitly configured extra roles such as Administrator.
     chartRolePrefix: 'psiq',
     chartExtraRoles: ['administrator'],
+    // Join ID used to read Employee Login Audit Trail data from employee searches.
     loginAuditJoin: 'loginaudittrail'
   };
 
+  // Suitelet entry point. Builds native NetSuite filter fields, runs the data
+  // pipeline, and injects the complete dashboard as INLINEHTML.
   function onRequest(context) {
     assertAllowedAccount();
 
     const request = context.request;
     const response = context.response;
+    // Normalize URL/form parameters once so search and renderer code can rely on
+    // a consistent filter object.
     const filters = normalizeFilters(request.parameters || {});
     const form = serverWidget.createForm({ title: CONFIG.dashboardTitle });
 
     addFilterFields(form, filters);
 
+    // The dashboard is self-contained in one INLINEHTML field, avoiding separate
+    // client script/CSS/File Cabinet assets.
     const htmlField = form.addField({
       id: 'custpage_login_html',
       label: 'Employee Last Login',
       type: serverWidget.FieldType.INLINEHTML
     });
+    // Place the custom dashboard below the standard filter controls and give it a
+    // full row in NetSuite's form layout.
     htmlField.updateLayoutType({ layoutType: serverWidget.FieldLayoutType.OUTSIDEBELOW });
     htmlField.updateBreakType({ breakType: serverWidget.FieldBreakType.STARTROW });
 
     try {
+      // Build all data server-side so the initial dashboard render is complete
+      // without asynchronous browser calls.
       htmlField.defaultValue = buildHtml(getEmployeeLoginData(filters), filters);
     } catch (e) {
       log.error({ title: 'Employee last login dashboard failed', details: e });
+      // Render a friendly error block instead of letting the Suitelet fail with a
+      // raw stack trace.
       htmlField.defaultValue = buildErrorHtml(e);
     }
 
     response.writePage(form);
   }
 
+  // Ensures the Suitelet only runs in the intended account IDs.
   function assertAllowedAccount() {
     const allowedAccounts = CONFIG.allowedAccounts || [];
 
@@ -72,9 +105,11 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }
   }
 
+  // Adds native NetSuite filter fields above the dashboard.
   function addFilterFields(form, filters) {
     form.addFieldGroup({ id: 'custpage_filters', label: 'Filters' });
 
+    // Free-text employee filter checks name/email fields in the employee search.
     const employeeText = form.addField({
       id: 'custpage_employee_text',
       type: serverWidget.FieldType.TEXT,
@@ -83,6 +118,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
     employeeText.defaultValue = filters.employeeText;
 
+    // Role filter is applied after latest-login role selection so it filters the
+    // role associated with each employee's latest successful login.
     const roleText = form.addField({
       id: 'custpage_role_text',
       type: serverWidget.FieldType.TEXT,
@@ -91,6 +128,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
     roleText.defaultValue = filters.roleText;
 
+    // User-controlled stale threshold for KPI/status calculations.
     const staleDays = form.addField({
       id: 'custpage_stale_days',
       type: serverWidget.FieldType.INTEGER,
@@ -99,6 +137,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
     staleDays.defaultValue = String(filters.staleDays);
 
+    // Month count is clamped later so charts do not become unreadably wide.
     const chartMonths = form.addField({
       id: 'custpage_chart_months',
       type: serverWidget.FieldType.INTEGER,
@@ -107,6 +146,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
     chartMonths.defaultValue = String(filters.chartMonths);
 
+    // Login Access Only usually keeps the dashboard focused on users who can log
+    // in, but a fallback path exists for accounts where this filter fails.
     const loginAccessOnly = form.addField({
       id: 'custpage_login_access_only',
       type: serverWidget.FieldType.CHECKBOX,
@@ -115,6 +156,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
     loginAccessOnly.defaultValue = filters.loginAccessOnly ? 'T' : 'F';
 
+    // Includes employees with no successful Login Audit Trail record when checked.
     const showNeverLogged = form.addField({
       id: 'custpage_show_never_logged',
       type: serverWidget.FieldType.CHECKBOX,
@@ -123,6 +165,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
     showNeverLogged.defaultValue = filters.showNeverLogged ? 'T' : 'F';
 
+    // Inactive employees are excluded by default to keep the operational view
+    // focused, but can be included for audit/review work.
     const includeInactive = form.addField({
       id: 'custpage_include_inactive',
       type: serverWidget.FieldType.CHECKBOX,
@@ -134,6 +178,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     form.addSubmitButton({ label: 'Refresh Login Report' });
   }
 
+  // Normalizes Suitelet parameters from either NetSuite form field IDs or shorter
+  // URL parameter names.
   function normalizeFilters(params) {
     return {
       employeeText: String(params.custpage_employee_text || params.employeeText || '').trim(),
@@ -146,6 +192,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Supports NetSuite checkbox values plus common URL truthy strings.
   function normalizeCheckbox(value, defaultValue) {
     if (value === null || value === undefined || value === '') return !!defaultValue;
 
@@ -153,11 +200,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return text === 'T' || text === 'TRUE' || text === 'Y' || text === 'YES' || text === '1';
   }
 
+  // Converts positive numeric input to an integer with a configured fallback.
   function normalizePositiveInteger(value, defaultValue) {
     const n = Number(value || defaultValue);
     return n > 0 ? Math.floor(n) : defaultValue;
   }
 
+  // Chart searches ignore role-text and never-logged filters so chart data stays
+  // focused on actual successful login activity by role.
   function buildChartFilters(filters) {
     return Object.assign({}, filters, {
       roleText: '',
@@ -165,6 +215,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
   }
 
+  // Determines whether a role should appear in today/monthly role charts.
   function isChartRole(roleName) {
     const prefix = String(CONFIG.chartRolePrefix || '').toLowerCase();
     const normalizedRoleName = String(roleName || '').trim().toLowerCase();
@@ -176,10 +227,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return normalizedRoleName.indexOf(prefix) === 0;
   }
 
+  // Special-case helper used for Administrator role styling.
   function isAdministratorRole(roleName) {
     return String(roleName || '').trim().toLowerCase() === 'administrator';
   }
 
+  // Runs the dashboard data fetch, with a fallback when the login-access filter is
+  // unavailable in a particular account/search context.
   function getEmployeeLoginData(filters) {
     try {
       return runEmployeeLastLoginSearch(filters, filters.loginAccessOnly);
@@ -187,6 +241,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
       if (!filters.loginAccessOnly) throw e;
 
       try {
+        // If filtering on giveaccess fails, retry without that filter and warn the
+        // user rather than failing the entire dashboard.
         const fallbackData = runEmployeeLastLoginSearch(filters, false);
         fallbackData.warnings.push(
           'Login Access filter could not be applied in this account/search context, so active employees are shown without that filter.'
@@ -203,6 +259,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }
   }
 
+  // Main employee latest-login search. It summarizes employee/login-audit data,
+  // builds one latest successful login row per employee, then computes dashboard
+  // rows, KPIs, and role trend data.
   function runEmployeeLastLoginSearch(filters, useLoginAccessFilter) {
     const columns = buildEmployeeLoginColumns();
     const employeeSearch = search.create({
@@ -219,6 +278,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
       usedLoginAccessFilter: !!useLoginAccessFilter
     };
 
+    // Paged search avoids NetSuite getRange limits and allows early stopping at a
+    // configured summary-row cap.
     const pagedData = employeeSearch.runPaged({ pageSize: getPageSize() });
     stats.sourceSummaryRows = pagedData.count || 0;
 
@@ -231,6 +292,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
         if (stats.scannedSummaryRows >= CONFIG.summaryRowLimit) break;
 
         stats.scannedSummaryRows += 1;
+        // Each summary row may represent an employee/role/status combination; the
+        // processor collapses those into the latest successful login per employee.
         processEmployeeLoginResult(page.data[j], columns, employeeMap);
       }
     }
@@ -238,6 +301,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     stats.hitQueryLimit = stats.sourceSummaryRows > stats.scannedSummaryRows;
 
     const baseRows = Object.keys(employeeMap).map(id => employeeMap[id]);
+    // Chart rows intentionally ignore the table role filter and never-logged rows
+    // so the charts show login activity rather than filtered table state.
     const chartRows = finalizeEmployeeRows(baseRows, Object.assign({}, filters, {
       roleText: '',
       showNeverLogged: false
@@ -250,6 +315,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     let monthlyRoleTrend = fallbackMonthlyRoleTrend;
 
     try {
+      // Prefer dedicated chart searches because they can count unique employees
+      // by role/day or role/month more accurately than latest-login rows.
       const searchedTodayRoleTrend = buildTodayRoleLoginTrend(buildChartFilters(filters), useLoginAccessFilter);
       todayRoleTrend = searchedTodayRoleTrend.roles.length || !fallbackTodayRoleTrend.roles.length ?
         searchedTodayRoleTrend :
@@ -260,6 +327,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }
 
     try {
+      // Same strategy for the monthly chart: dedicated search first, latest-row
+      // fallback when the chart search fails or returns no data.
       const searchedMonthlyRoleTrend = buildMonthlyRoleLoginTrend(buildChartFilters(filters), useLoginAccessFilter);
       monthlyRoleTrend = searchedMonthlyRoleTrend.roles.length || !fallbackMonthlyRoleTrend.roles.length ?
         searchedMonthlyRoleTrend :
@@ -270,6 +339,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }
 
     if (stats.hitQueryLimit) {
+      // Warn rather than fail when configured limits truncate the search.
       warnings.push(
         'The search returned more summary rows than the configured limit. Narrow filters or increase CONFIG.summaryRowLimit for complete results.'
       );
@@ -299,6 +369,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Dedicated search for today's successful logins by role. It counts each
+  // employee once per role for the current day.
   function buildTodayRoleLoginTrend(filters, useLoginAccessFilter) {
     const today = stripTime(new Date());
     const columns = buildTodayRoleLoginColumns();
@@ -315,6 +387,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
       queryLimit: CONFIG.todaySummaryRowLimit,
       hitQueryLimit: false
     };
+    // This search can produce many grouped rows, so it has its own higher limit.
     const pagedData = employeeSearch.runPaged({ pageSize: getPageSize() });
     stats.sourceSummaryRows = pagedData.count || 0;
 
@@ -327,6 +400,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
         if (stats.scannedSummaryRows >= CONFIG.todaySummaryRowLimit) break;
 
         stats.scannedSummaryRows += 1;
+        // The processor filters out failed logins, non-chart roles, and duplicate
+        // employee/role combinations.
         processTodayRoleLoginResult({
           result: page.data[j],
           columns,
@@ -341,6 +416,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return finalizeTodayRoleTrend(roleMap, today, stats);
   }
 
+  // Empty today trend used when no data is available but the renderer still needs
+  // a stable trend object shape.
   function buildEmptyTodayRoleTrend() {
     return finalizeTodayRoleTrend({}, stripTime(new Date()), {
       scannedSummaryRows: 0,
@@ -350,12 +427,17 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
   }
 
+  // Fallback today trend built from latest-login rows. This is less complete than
+  // the dedicated audit search but keeps the dashboard useful if that search
+  // fails in an account-specific context.
   function buildTodayRoleTrendFromRows(rows) {
     const today = stripTime(new Date());
     const todayKey = toIsoDate(today);
     const roleMap = {};
 
     (rows || []).forEach(row => {
+      // Only latest-login rows whose latest successful login is today can
+      // contribute to the fallback.
       if (!row.lastLoginDate || toIsoDate(stripTime(row.lastLoginDate)) !== todayKey) return;
 
       const roleName = row.roleName || 'No Role';
@@ -391,6 +473,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
   }
 
+  // Search columns for today's role trend. Summary columns group by employee and
+  // role while taking the max login date for display.
   function buildTodayRoleLoginColumns() {
     const summary = search.Summary;
     const colInternalId = search.createColumn({ name: 'internalid', summary: summary.GROUP });
@@ -433,6 +517,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Builds today's trend filters by extending the base employee filters with a
+  // Login Audit Trail date range for today.
   function buildTodayRoleSearchFilters(filters, useLoginAccessFilter, today) {
     const searchFilters = buildEmployeeSearchFilters(filters, useLoginAccessFilter) || [];
 
@@ -442,6 +528,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return searchFilters;
   }
 
+  // Processes one grouped search result for today's role chart.
   function processTodayRoleLoginResult(options) {
     const result = options.result;
     const columns = options.columns;
@@ -455,20 +542,26 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     const status = String(result.getText(columns.colLoginStatus) || result.getValue(columns.colLoginStatus) || '');
 
     if (!employeeId || !isSuccessfulLoginStatus(status)) {
+      // The chart intentionally tracks only successful employee logins.
       return;
     }
 
     const roleName = String(result.getText(columns.colLoginRole) || result.getValue(columns.colLoginRole) || 'No Role');
 
     if (!isChartRole(roleName)) {
+      // Filter to PSiQ/Admin roles so operational roles dominate the chart.
       return;
     }
 
     if (filters.roleText && roleName.toLowerCase().indexOf(String(filters.roleText).toLowerCase()) < 0) {
+      // The dedicated chart search can still honor a roleText filter when called
+      // directly with one, though the normal dashboard chart uses buildChartFilters().
       return;
     }
 
     const uniqueKey = roleName + '|' + employeeId;
+    // Avoid double-counting an employee under the same role if multiple matching
+    // audit rows are returned.
     if (options.uniqueRoleEmployee[uniqueKey]) return;
 
     options.uniqueRoleEmployee[uniqueKey] = true;
@@ -494,6 +587,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
   }
 
+  // Sorts and limits today role data, grouping overflow roles into an Other role.
   function finalizeTodayRoleTrend(roleMap, today, stats) {
     const roleLimit = Math.max(1, Number(CONFIG.todayRoleLimit || 12));
     const sortedRoles = Object.keys(roleMap)
@@ -503,6 +597,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     const hiddenRoles = sortedRoles.slice(roleLimit);
 
     if (hiddenRoles.length) {
+      // Group lower-volume roles so the chart stays readable without discarding
+      // their employee detail.
       visibleRoles.push({
         roleName: 'Other PSiQ/Admin Roles',
         count: hiddenRoles.reduce((sum, role) => sum + Number(role.count || 0), 0),
@@ -531,11 +627,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Alphabetical sort for employee tiles in role detail panels.
   function compareTodayRoleEmployees(a, b) {
     return String(a.name || '').localeCompare(String(b.name || '')) ||
       String(a.email || '').localeCompare(String(b.email || ''));
   }
 
+  // Dedicated monthly search for successful logins by role and month.
   function buildMonthlyRoleLoginTrend(filters, useLoginAccessFilter) {
     const monthBuckets = buildMonthBuckets(filters.chartMonths);
     const monthLookup = buildMonthLookup(monthBuckets);
@@ -565,6 +663,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
         if (stats.scannedSummaryRows >= CONFIG.monthlySummaryRowLimit) break;
 
         stats.scannedSummaryRows += 1;
+        // The processor deduplicates employee/role/month so one employee counts
+        // once per role per month.
         processMonthlyRoleLoginResult({
           result: page.data[j],
           columns,
@@ -580,6 +680,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return finalizeMonthlyRoleTrend(monthBuckets, roleMap, stats);
   }
 
+  // Empty monthly trend with the requested month buckets.
   function buildEmptyMonthlyRoleTrend(filters) {
     return finalizeMonthlyRoleTrend(buildMonthBuckets(filters.chartMonths), {}, {
       scannedSummaryRows: 0,
@@ -589,6 +690,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
   }
 
+  // Fallback monthly trend built from latest-login rows. It only knows each
+  // employee's latest login month, but it is useful when the dedicated monthly
+  // audit search is unavailable.
   function buildMonthlyRoleTrendFromRows(rows, filters) {
     const monthBuckets = buildMonthBuckets(filters.chartMonths);
     const monthLookup = buildMonthLookup(monthBuckets);
@@ -597,6 +701,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     (rows || []).forEach(row => {
       if (!row.lastLoginDate) return;
 
+      // Skip latest-login rows outside the requested chart month range.
       const monthKey = toMonthKey(stripTime(row.lastLoginDate));
       if (!monthLookup[monthKey]) return;
 
@@ -635,6 +740,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
   }
 
+  // Search columns for the monthly role trend. The formulatext column groups login
+  // audit dates into YYYY-MM month buckets.
   function buildMonthlyRoleLoginColumns() {
     const summary = search.Summary;
     const colInternalId = search.createColumn({ name: 'internalid', summary: summary.GROUP });
@@ -684,6 +791,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Adds a lower-bound login-audit date filter for the monthly chart. The month
+  // lookup later discards anything outside exact bucket keys.
   function buildMonthlyRoleSearchFilters(filters, useLoginAccessFilter, startDate) {
     const searchFilters = buildEmployeeSearchFilters(filters, useLoginAccessFilter) || [];
 
@@ -692,6 +801,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return searchFilters;
   }
 
+  // Processes one grouped search result for the monthly role chart.
   function processMonthlyRoleLoginResult(options) {
     const result = options.result;
     const columns = options.columns;
@@ -706,12 +816,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     const status = String(result.getText(columns.colLoginStatus) || result.getValue(columns.colLoginStatus) || '');
 
     if (!employeeId || !options.monthLookup[monthKey] || !isSuccessfulLoginStatus(status)) {
+      // Require a known month bucket and a successful login status.
       return;
     }
 
     const roleName = String(result.getText(columns.colLoginRole) || result.getValue(columns.colLoginRole) || 'No Role');
 
     if (!isChartRole(roleName)) {
+      // Monthly chart uses the same PSiQ/Admin role scope as today's chart.
       return;
     }
 
@@ -720,6 +832,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }
 
     const uniqueKey = roleName + '|' + monthKey + '|' + employeeId;
+    // Count each employee only once for a role/month pair.
     if (options.uniqueRoleMonthEmployee[uniqueKey]) return;
 
     options.uniqueRoleMonthEmployee[uniqueKey] = true;
@@ -747,6 +860,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     });
   }
 
+  // Adds an employee detail row under a role/month bucket.
   function addMonthlyRoleEmployee(role, monthKey, employee) {
     if (!role.employeesByMonth) role.employeesByMonth = {};
     if (!role.employeesByMonth[monthKey]) role.employeesByMonth[monthKey] = [];
@@ -754,10 +868,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     role.employeesByMonth[monthKey].push(employee);
   }
 
+  // Builds the final monthly trend object for both chart and matrix renderers.
   function finalizeMonthlyRoleTrend(monthBuckets, roleMap, stats) {
     const sortedRoles = Object.keys(roleMap)
       .map(roleName => roleMap[roleName])
       .sort((a, b) => b.total - a.total || a.roleName.localeCompare(b.roleName));
+    // The chart shows fewer roles for readability; the matrix can show more.
     const chartRoleLimit = Math.max(1, Number(CONFIG.monthlyChartRoleLimit || 5));
     const detailRoleLimit = Math.max(chartRoleLimit, Number(CONFIG.monthlyRoleLimit || 60));
     const chartRoles = buildMonthlyRoleSeries(sortedRoles, monthBuckets, chartRoleLimit);
@@ -765,6 +881,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     const roles = chartRoles.roles;
 
     const months = monthBuckets.map(month => {
+      // Month totals are based on visible chart roles, including the grouped Other
+      // role when present.
       const total = roles.reduce((sum, role) => sum + Number(role.countByMonth[month.key] || 0), 0);
       return Object.assign({}, month, { total });
     });
@@ -780,11 +898,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Builds a role series for either the chart or the detailed matrix, grouping
+  // overflow roles into a single Other bucket.
   function buildMonthlyRoleSeries(sortedRoles, monthBuckets, roleLimit) {
     const visibleRoles = sortedRoles.slice(0, roleLimit);
     const hiddenRoles = sortedRoles.slice(roleLimit);
 
     if (hiddenRoles.length) {
+      // Preserve hidden role employee detail by concatenating it into the grouped
+      // Other role for every month.
       const otherRole = {
         roleName: 'Other PSiQ/Admin Roles',
         total: 0,
@@ -828,6 +950,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Builds an array of month buckets ending with the current month. The count is
+  // capped at 24 so charts remain usable.
   function buildMonthBuckets(monthCount) {
     const count = Math.max(1, Math.min(24, Number(monthCount || CONFIG.monthlyChartMonthsDefault)));
     const currentMonth = new Date();
@@ -849,6 +973,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return buckets;
   }
 
+  // Builds a quick membership map for valid month keys.
   function buildMonthLookup(monthBuckets) {
     return monthBuckets.reduce((map, month) => {
       map[month.key] = true;
@@ -856,6 +981,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }, {});
   }
 
+  // Formats a Date as YYYY-MM for monthly grouping.
   function toMonthKey(dateObj) {
     return [
       dateObj.getFullYear(),
@@ -863,21 +989,25 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     ].join('-');
   }
 
+  // Short month label for chart axes.
   function formatMonthLabel(dateObj) {
     const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     return names[dateObj.getMonth()] + " '" + String(dateObj.getFullYear()).substring(2);
   }
 
+  // Full month label for tooltips and detail panel headings.
   function formatMonthTitle(dateObj) {
     const names = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     return names[dateObj.getMonth()] + ' ' + dateObj.getFullYear();
   }
 
+  // Full date label for today's chart header.
   function formatFullDate(dateObj) {
     const names = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     return names[dateObj.getMonth()] + ' ' + dateObj.getDate() + ', ' + dateObj.getFullYear();
   }
 
+  // Formats a Date as YYYY-MM-DD.
   function toIsoDate(dateObj) {
     return [
       dateObj.getFullYear(),
@@ -886,6 +1016,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     ].join('-');
   }
 
+  // Palette for roles, reused by charts, legends, and tiles.
   function getRoleColor(index) {
     const colors = [
       '#2563eb', '#14b8a6', '#f97316', '#d946ef', '#8b5cf6', '#64748b',
@@ -896,6 +1027,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return colors[index % colors.length];
   }
 
+  // Softer companion palette for role visuals.
   function getRoleLightColor(index) {
     const colors = [
       '#93c5fd', '#5eead4', '#fdba74', '#c4b5fd', '#f9a8d4', '#bef264',
@@ -906,6 +1038,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return colors[index % colors.length];
   }
 
+  // Search columns for the main latest-login employee summary.
   function buildEmployeeLoginColumns() {
     const summary = search.Summary;
     const colInternalId = search.createColumn({ name: 'internalid', summary: summary.GROUP, sort: search.Sort.ASC });
@@ -952,18 +1085,23 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Base employee filters shared by the main and chart searches.
   function buildEmployeeSearchFilters(filters, useLoginAccessFilter) {
     const searchFilters = [];
 
     if (!filters.includeInactive) {
+      // Exclude inactive employees unless the user asks for an audit-inclusive
+      // view.
       pushAndFilter(searchFilters, ['isinactive', 'is', 'F']);
     }
 
     if (useLoginAccessFilter) {
+      // Limits the view to users who are allowed to log in.
       pushAndFilter(searchFilters, ['giveaccess', 'is', 'T']);
     }
 
     if (filters.employeeText) {
+      // Search common employee identity fields for the free-text filter.
       const text = filters.employeeText;
       pushAndFilter(searchFilters, [
         ['entityid', 'contains', text],
@@ -979,16 +1117,21 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return searchFilters.length ? searchFilters : null;
   }
 
+  // Adds an AND separator only when the filter expression already has content.
   function pushAndFilter(filters, clause) {
     if (filters.length) filters.push('AND');
     filters.push(clause);
   }
 
+  // Collapses grouped employee/login-audit search results into one latest
+  // successful-login row per employee.
   function processEmployeeLoginResult(result, columns, employeeMap) {
     const id = String(result.getValue(columns.colInternalId) || '');
     if (!id) return;
 
     if (!employeeMap[id]) {
+      // Initialize the employee row before evaluating individual login status
+      // groups; employees with no success can still appear as never logged in.
       employeeMap[id] = {
         id,
         name: String(result.getValue(columns.colEntityId) || ''),
@@ -1006,6 +1149,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }
 
     const status = String(result.getText(columns.colLoginStatus) || result.getValue(columns.colLoginStatus) || '');
+    // Only successful login audit rows are considered for last-login fields.
     if (!isSuccessfulLoginStatus(status)) return;
 
     const loginValue = result.getValue(columns.colLastLogin);
@@ -1014,6 +1158,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
 
     const row = employeeMap[id];
     if (!row.lastLoginDate || loginDate.getTime() > row.lastLoginDate.getTime()) {
+      // Keep the newest successful login plus the role tied to that login.
       row.lastLogin = String(loginValue || '');
       row.lastLoginDate = loginDate;
       row.roleId = String(result.getValue(columns.colLoginRole) || '');
@@ -1022,19 +1167,26 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }
   }
 
+  // Adds derived fields such as days-since-login and stale/current-month flags,
+  // then applies table-level filters.
   function finalizeEmployeeRows(rows, filters) {
     const roleFilter = String(filters.roleText || '').toLowerCase();
     const today = stripTime(new Date());
+    const currentMonthKey = toMonthKey(today);
 
     return (rows || []).map(row => {
+      // Null daysSinceLogin means the employee has no successful login.
       const daysSinceLogin = row.lastLoginDate ?
         Math.max(0, Math.floor((today.getTime() - stripTime(row.lastLoginDate).getTime()) / (24 * 60 * 60 * 1000))) :
         null;
+      const loginMonthKey = row.lastLoginDate ? toMonthKey(stripTime(row.lastLoginDate)) : '';
 
       return Object.assign({}, row, {
         daysSinceLogin,
         loginAgeLabel: daysSinceLogin === null ? 'Never' : String(daysSinceLogin),
-        stale: daysSinceLogin === null || daysSinceLogin >= filters.staleDays
+        stale: daysSinceLogin === null || daysSinceLogin >= filters.staleDays,
+        loginMonthKey,
+        currentMonthLogin: loginMonthKey === currentMonthKey
       });
     }).filter(row => {
       if (!filters.showNeverLogged && !row.lastLoginDate) return false;
@@ -1043,6 +1195,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     }).sort(compareEmployeeRows);
   }
 
+  // Newest login first; names break ties.
   function compareEmployeeRows(a, b) {
     const aTime = a.lastLoginDate ? a.lastLoginDate.getTime() : 0;
     const bTime = b.lastLoginDate ? b.lastLoginDate.getTime() : 0;
@@ -1050,6 +1203,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     return bTime - aTime || a.name.localeCompare(b.name);
   }
 
+  // Computes KPI totals from the final visible rows.
   function buildSummary(rows, filters) {
     const loggedIn = rows.filter(r => r.lastLoginDate).length;
     const neverLogged = rows.filter(r => !r.lastLoginDate).length;
@@ -1075,6 +1229,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/runtime', 'N/url', 'N/format'], (
     };
   }
 
+  // Builds the full dashboard markup: CSS, top bar, warnings, KPI/detail panels,
+  // role charts, employee table, popup, and client script.
   function buildHtml(data, filters) {
     return `
 ${buildCss()}
@@ -1127,6 +1283,7 @@ ${buildScript()}
 `;
   }
 
+  // Error-state renderer used when the data pipeline throws.
   function buildErrorHtml(error) {
     return `
 ${buildCss()}
@@ -1140,6 +1297,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Renders one warning banner per data/search warning.
   function buildWarningsHtml(warnings) {
     if (!warnings || !warnings.length) return '';
 
@@ -1148,10 +1306,12 @@ ${buildCss()}
     }).join('');
   }
 
+  // Footer credit with the developer badge.
   function buildDeveloperCreditHtml() {
     return `<span class="developer-credit">Developed by <strong>${esc(CONFIG.developedBy)}</strong>${buildDeveloperAdminBadgeHtml(false)}</span>`;
   }
 
+  // Badge used to highlight the dashboard developer in multiple contexts.
   function buildDeveloperAdminBadgeHtml(compact) {
     const className = compact ? 'developer-admin-badge compact' : 'developer-admin-badge';
     const label = compact ? 'Dev' : 'Dashboard Developer';
@@ -1164,6 +1324,7 @@ ${buildCss()}
     </span>`;
   }
 
+  // Badge used for known service/automation account email domains.
   function buildServiceAccountBadgeHtml(compact) {
     const className = compact ? 'service-account-badge compact' : 'service-account-badge';
 
@@ -1173,6 +1334,7 @@ ${buildCss()}
     </span>`;
   }
 
+  // Identifies the dashboard developer by configured names or email addresses.
   function isDashboardDeveloperEmployee(employee) {
     const name = normalizeDeveloperMatchText(employee && employee.name);
     const email = normalizeDeveloperMatchText(employee && employee.email);
@@ -1182,10 +1344,12 @@ ${buildCss()}
     return (name && names.indexOf(name) >= 0) || (email && emails.indexOf(email) >= 0);
   }
 
+  // Wrapper for service account detection on employee objects.
   function isServiceAccountEmployee(employee) {
     return isServiceAccountEmail(employee && employee.email);
   }
 
+  // Identifies service accounts by email domain.
   function isServiceAccountEmail(email) {
     const text = String(email || '').trim().toLowerCase();
     const domains = (CONFIG.serviceAccountEmailDomains || []).map(domain => String(domain || '').trim().toLowerCase());
@@ -1195,6 +1359,7 @@ ${buildCss()}
     return domains.indexOf(text.split('@').pop()) >= 0;
   }
 
+  // Renders an escaped employee email and optional service-account badge.
   function buildEmployeeEmailHtml(employee) {
     const email = String(employee && employee.email ? employee.email : '');
     if (!email) return '';
@@ -1202,10 +1367,12 @@ ${buildCss()}
     return esc(email) + (isServiceAccountEmployee(employee) ? buildServiceAccountBadgeHtml(true) : '');
   }
 
+  // Normalizes names/emails before matching configured developer identities.
   function normalizeDeveloperMatchText(value) {
     return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
+  // Builds clickable KPI cards and the hidden detail panels attached to them.
   function buildKpiHtml(summary, rows) {
     const cards = [
       { id: 'shown', label: 'Employees Shown', value: summary.total, className: '' },
@@ -1224,6 +1391,7 @@ ${buildCss()}
       </button>`).join('')}</div>${buildKpiDetailHtml(rows, summary)}`;
   }
 
+  // Builds all KPI detail panels so client-side clicks only need to show/hide.
   function buildKpiDetailHtml(rows, summary) {
     const allRows = rows || [];
     const loggedInRows = allRows.filter(row => row.lastLoginDate);
@@ -1266,6 +1434,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds one employee-list panel for a KPI category.
   function buildKpiEmployeePanelHtml(options) {
     const rows = options.rows || [];
     const tableId = options.id + 'Table';
@@ -1283,6 +1452,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds a reusable employee table for KPI and department drilldowns.
   function buildKpiEmployeeTableHtml(tableId, rows) {
     return `
 <div class="kpi-table-scroll">
@@ -1305,6 +1475,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Renders one employee row in KPI/department drilldown tables.
   function buildKpiEmployeeTableRowHtml(row) {
     const status = getEmployeeStatus(row);
     const roleName = row.roleName || 'No successful login role';
@@ -1321,6 +1492,7 @@ ${buildCss()}
 </tr>`;
   }
 
+  // Builds the role-summary KPI panel.
   function buildKpiRoleSummaryPanelHtml(rows) {
     const roleRows = buildKpiRoleSummaryRows(rows);
     const tableId = 'kpiRoleSummaryTable';
@@ -1338,6 +1510,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Aggregates visible rows by latest successful login role.
   function buildKpiRoleSummaryRows(rows) {
     const roleMap = {};
 
@@ -1366,6 +1539,7 @@ ${buildCss()}
       .sort((a, b) => b.total - a.total || a.roleName.localeCompare(b.roleName));
   }
 
+  // Builds the role-summary table.
   function buildKpiRoleSummaryTableHtml(tableId, roleRows) {
     return `
 <div class="kpi-table-scroll">
@@ -1391,6 +1565,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds the department-summary KPI panel.
   function buildKpiDepartmentSummaryPanelHtml(rows) {
     const departmentRows = buildKpiDepartmentSummaryRows(rows);
     const tableId = 'kpiDepartmentSummaryTable';
@@ -1408,6 +1583,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Aggregates visible rows by department.
   function buildKpiDepartmentSummaryRows(rows) {
     const departmentMap = {};
 
@@ -1437,6 +1613,7 @@ ${buildCss()}
       .sort((a, b) => b.total - a.total || a.departmentName.localeCompare(b.departmentName));
   }
 
+  // Builds the department-summary table.
   function buildKpiDepartmentSummaryTableHtml(tableId, departmentRows) {
     return `
 <div class="kpi-table-scroll">
@@ -1466,6 +1643,8 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds the department distribution section with donut, ranking table, and
+  // hidden employee detail panels.
   function buildDepartmentDistributionTileHtml(rows) {
     const allRows = rows || [];
     const sourceRows = buildKpiDepartmentSummaryRows(allRows);
@@ -1492,6 +1671,8 @@ ${buildCss()}
 </section>`;
   }
 
+  // Reduces department rows to the top N departments plus an optional Other
+  // bucket, adding rank/color/share fields for rendering.
   function buildDepartmentDistributionRows(sourceRows, limit) {
     const totalEmployees = (sourceRows || []).reduce((sum, row) => sum + Number(row.total || 0), 0);
     const visibleLimit = Math.max(1, Number(limit || 10));
@@ -1499,6 +1680,8 @@ ${buildCss()}
     const hiddenRows = (sourceRows || []).slice(visibleLimit);
 
     if (hiddenRows.length) {
+      // Group smaller departments so the donut/table remain readable while still
+      // preserving the hidden department names for drilldown.
       visibleRows.push({
         departmentName: 'Other Departments',
         total: hiddenRows.reduce((sum, row) => sum + Number(row.total || 0), 0),
@@ -1521,6 +1704,7 @@ ${buildCss()}
     }).filter(row => Number(row.total || 0) > 0);
   }
 
+  // Builds an SVG donut showing employee share by department.
   function buildDepartmentDonutSvg(departmentRows, totalEmployees) {
     const size = 260;
     const center = size / 2;
@@ -1535,6 +1719,8 @@ ${buildCss()}
       const gap = Math.max(0, circumference - dash);
       const segmentOffset = -offset;
       const title = row.departmentName + ': ' + formatWholeNumber(value) + ' employee(s), ' + formatOneDecimal(row.percentage) + '%';
+      // Offset is accumulated in circumference units to stack each donut segment
+      // around the same circle.
       offset += dash;
 
       return `<circle cx="${center}" cy="${center}" r="${radius}" fill="none" stroke="${escAttr(row.color)}" stroke-width="${strokeWidth}" stroke-dasharray="${roundSvgNumber(dash)} ${roundSvgNumber(gap)}" stroke-dashoffset="${roundSvgNumber(segmentOffset)}" transform="rotate(-90 ${center} ${center})" class="department-donut-segment">
@@ -1554,6 +1740,7 @@ ${buildCss()}
       const y = center + (Math.sin(labelAngle) * labelRadius);
       labelOffset += dash;
 
+      // Hide labels for tiny slices to reduce overlap.
       if (percentage < 4) return '';
 
       return `<text x="${roundSvgNumber(x)}" y="${roundSvgNumber(y)}" text-anchor="middle" dominant-baseline="middle" class="department-donut-label">${esc(formatOneDecimal(percentage))}%</text>`;
@@ -1570,6 +1757,7 @@ ${buildCss()}
 </svg>`;
   }
 
+  // Builds the department ranking table next to the donut.
   function buildDepartmentRankingTableHtml(departmentRows) {
     return `
 <div class="department-ranking-table-wrap">
@@ -1605,6 +1793,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds all department employee panels up front so ranking clicks are instant.
   function buildDepartmentEmployeeDetailHtml(departmentRows, rows) {
     return `
 <div class="department-employee-detail" id="departmentEmployeeDetail">
@@ -1630,6 +1819,8 @@ ${buildCss()}
 </div>`;
   }
 
+  // Returns employees matching one visible department bucket, including all hidden
+  // departments when the selected bucket is Other Departments.
   function buildDepartmentEmployeeRows(department, rows) {
     const hiddenDepartmentMap = {};
 
@@ -1648,6 +1839,7 @@ ${buildCss()}
     }).slice().sort(compareEmployeeRows);
   }
 
+  // Builds the "Today Login by Role" panel.
   function buildTodayRoleTrendHtml(trend, filters) {
     const roleCount = trend && trend.roles ? trend.roles.length : 0;
     const hiddenRoleText = trend && trend.hiddenRoleCount ?
@@ -1667,6 +1859,7 @@ ${buildCss()}
 </section>`;
   }
 
+  // Builds the horizontal bar SVG for today's logins by role.
   function buildTodayRoleChartSvg(trend) {
     const roles = trend.roles || [];
     const width = 1040;
@@ -1681,6 +1874,7 @@ ${buildCss()}
     const max = Math.max(1, Number(trend.maxRoleCount || 1));
     const guideHeight = Math.max(rowHeight, roles.length * rowHeight);
     const grid = [0, 0.5, 1].map(p => {
+      // A three-point guide gives enough scale context for a compact chart.
       const x = left + (plotWidth * p);
       const label = Math.round(max * p);
 
@@ -1699,6 +1893,8 @@ ${buildCss()}
       const countClass = countInside ? 'today-role-count inside' : 'today-role-count';
       const administratorRole = isAdministratorRole(role.roleName);
 
+      // Each bar is keyboard/click accessible and opens the matching employee
+      // detail panel.
       return `
       <g class="today-role-row${administratorRole ? ' administrator-role-row' : ''}" data-role-index="${index}" role="button" tabindex="0" focusable="true" onclick="showTodayRoleEmployees(${index})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showTodayRoleEmployees(${index});}">
         <text x="${left - 16}" y="${roundSvgNumber(y + 22)}" text-anchor="end" class="today-role-row-label${administratorRole ? ' administrator-role-svg-label' : ''}">
@@ -1736,6 +1932,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds the hidden detail panels for the today role chart.
   function buildTodayRoleEmployeeDetailHtml(trend) {
     const roles = trend.roles || [];
 
@@ -1746,6 +1943,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds one today-role employee detail panel.
   function buildTodayRoleEmployeePanelHtml(role, index, trend) {
     const employees = role.employees || [];
     const panelId = 'todayRoleEmployees' + index;
@@ -1766,6 +1964,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds one employee tile in today/monthly role detail panels.
   function buildTodayRoleEmployeeItemHtml(employee) {
     const name = employee.name || employee.email || 'Unnamed employee';
     const weekendLogin = !!employee.weekendLogin;
@@ -1778,6 +1977,8 @@ ${buildCss()}
       email: employee.email
     });
 
+    // Data attributes power CSV export and the detail popup without another
+    // server call.
     return `
 <button type="button" class="today-role-employee employee-export-row${weekendLogin ? ' weekend-login-member' : ''}${dashboardDeveloper ? ' dashboard-developer-member' : ''}${serviceAccount ? ' service-account-member' : ''}" data-employee-id="${escAttr(employee.id || employee.email || name)}" data-employee-name="${escAttr(name)}" data-employee-email="${escAttr(employee.email || '')}" data-employee-department="${escAttr(employee.department || 'No Department')}" data-employee-last-login="${escAttr(employee.lastLogin || 'Not available')}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-weekend-login-label="${escAttr(weekendLogin ? weekendLabel : '')}" data-dashboard-developer="${dashboardDeveloper ? 'T' : 'F'}" data-service-account="${serviceAccount ? 'T' : 'F'}" data-employee-url="${escAttr(employee.employeeUrl || '')}" onclick="openEmployeeLoginPopup(this)">
   <b>${esc(name)}</b>
@@ -1787,6 +1988,7 @@ ${buildCss()}
 </button>`;
   }
 
+  // Popup shell for employee detail launched from role employee tiles.
   function buildEmployeeLoginPopupHtml() {
     return `
 <div id="employeeLoginPopup" class="employee-popup-backdrop" aria-hidden="true">
@@ -1827,6 +2029,8 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds the monthly role trend panel, including chart, matrix, and employee
+  // detail panels.
   function buildMonthlyRoleTrendHtml(trend, filters) {
     const roleCount = trend && trend.roles ? trend.roles.length : 0;
     const hiddenRoleText = trend && trend.hiddenRoleCount ?
@@ -1848,6 +2052,7 @@ ${buildCss()}
 </section>`;
   }
 
+  // Builds the stacked monthly role chart SVG.
   function buildMonthlyRoleChartSvg(trend) {
     const width = 1040;
     const height = 420;
@@ -1867,6 +2072,7 @@ ${buildCss()}
     const labelEvery = count > 14 ? Math.ceil(count / 12) : 1;
 
     const grid = [0, 0.25, 0.5, 0.75, 1].map(p => {
+      // Five grid lines make the stacked totals easier to read.
       const y = top + plotHeight - (plotHeight * p);
       const label = Math.round(max * p);
       return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" class="grid-line"></line><text x="16" y="${y + 4}" class="axis-label">${label}</text>`;
@@ -1874,6 +2080,7 @@ ${buildCss()}
     const monthHighlights = months.map((month, monthIndex) => {
       const x = left + (slot * monthIndex) + ((slot - barWidth) / 2);
 
+      // Highlight rectangles are activated when a chart/matrix cell is selected.
       return `<rect x="${roundSvgNumber(x - 8)}" y="${top - 10}" width="${roundSvgNumber(barWidth + 16)}" height="${roundSvgNumber(plotHeight + 20)}" rx="8" class="monthly-role-month-highlight" data-month-index="${monthIndex}">
         <title>${escAttr(month.title)}</title>
       </rect>`;
@@ -1890,6 +2097,8 @@ ${buildCss()}
     const totalLinePointText = totalLinePoints.map(point => {
       return roundSvgNumber(point.x) + ',' + roundSvgNumber(point.y);
     }).join(' ');
+    // Overlay a total trend line on top of stacked bars when there are at least
+    // two month points to connect.
     const totalTrendLine = totalLinePoints.length > 1 ? `
     <polyline points="${escAttr(totalLinePointText)}" class="monthly-total-line-shadow"></polyline>
     <polyline points="${escAttr(totalLinePointText)}" class="monthly-total-line"></polyline>
@@ -1918,6 +2127,8 @@ ${buildCss()}
         const tooltip = month.title + ' | ' + role.roleName + ': ' + value + ' employee(s). Click to view employees.';
         yCursor -= segmentHeight;
 
+        // Each stacked segment is clickable/keyboard-accessible and maps to the
+        // hidden employee panel for that role/month.
         return `<g class="monthly-role-segment" data-role-index="${roleIndex}" data-month-index="${monthIndex}" role="button" tabindex="0" focusable="true" onclick="showMonthlyRoleEmployees(${roleIndex}, ${monthIndex})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showMonthlyRoleEmployees(${roleIndex}, ${monthIndex});}">
           <rect x="${roundSvgNumber(x - 3)}" y="${roundSvgNumber(yCursor - 3)}" width="${roundSvgNumber(barWidth + 6)}" height="${roundSvgNumber(segmentHeight + 6)}" rx="5" class="monthly-role-selection"></rect>
           <rect x="${roundSvgNumber(x)}" y="${roundSvgNumber(yCursor)}" width="${roundSvgNumber(barWidth)}" height="${segmentHeight}" fill="${escAttr(role.color)}" rx="3" class="monthly-role-rect">
@@ -1928,6 +2139,7 @@ ${buildCss()}
       }).join('');
       const labelX = left + (slot * monthIndex) + (slot / 2);
       const showLabel = monthIndex === 0 || monthIndex === count - 1 || monthIndex % labelEvery === 0;
+      // Total labels sit just above each stacked bar.
       const totalLabel = month.total > 0 ?
         `<text x="${roundSvgNumber(labelX)}" y="${roundSvgNumber(Math.max(top + 12, yCursor - 7))}" text-anchor="middle" class="bar-total-label">${month.total}</text>` :
         '';
@@ -1959,6 +2171,8 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds hidden employee panels for both the chart role set and the larger
+  // matrix detail role set.
   function buildMonthlyRoleEmployeeDetailHtml(trend) {
     const months = trend.months || [];
     const roles = trend.roles || [];
@@ -1976,6 +2190,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds one role/month employee panel.
   function buildMonthlyRoleEmployeePanelHtml(role, month, roleIndex, monthIndex, panelPrefix) {
     const count = Number(role.countByMonth[month.key] || 0);
     if (!count) return '';
@@ -2000,6 +2215,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Builds the monthly role legend above the chart.
   function buildMonthlyRoleLegendHtml(roles) {
     return `<div class="role-legend">${roles.map(role => `
       <span class="role-legend-item${isAdministratorRole(role.roleName) ? ' administrator-role-legend' : ''}" style="${escAttr(getRoleLegendTileStyle(role.color))}" title="${escAttr(role.roleName + ': ' + formatWholeNumber(role.total) + ' employee-month total')}">
@@ -2009,10 +2225,12 @@ ${buildCss()}
       </span>`).join('')}</div>`;
   }
 
+  // Style helper for role legend tiles.
   function getRoleLegendTileStyle(roleColor) {
     return getRoleTileStyle(roleColor, 0.05, 0.16, 0.22, 3, 0.32);
   }
 
+  // Builds a colored role label used by summary/matrix tables.
   function buildRoleTileLabelHtml(label, roleColor) {
     const color = normalizeHexColor(roleColor, '#64748b');
     const administratorRole = isAdministratorRole(label);
@@ -2023,6 +2241,7 @@ ${buildCss()}
     </span>`;
   }
 
+  // Displays Administrator roles as special badges and all other roles as text.
   function buildRoleNameHtml(roleName) {
     const label = String(roleName || 'No successful login role');
 
@@ -2031,12 +2250,14 @@ ${buildCss()}
       esc(label);
   }
 
+  // Role text helper for inline legend/table labels.
   function buildRoleTextHtml(label, roleName) {
     return isAdministratorRole(roleName || label) ?
       `<span class="administrator-role-text">${esc(label)}</span>` :
       esc(label);
   }
 
+  // Builds a soft role tile style from a base role color.
   function getRoleTileStyle(roleColor, startMix, endMix, borderMix, stripeWidth, stripeOpacity) {
     const color = normalizeHexColor(roleColor, '#64748b');
     const softStart = mixHexColors('#ffffff', color, startMix);
@@ -2050,6 +2271,7 @@ ${buildCss()}
       'box-shadow:inset ' + Number(stripeWidth || 3) + 'px 0 0 rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',' + opacity + ')';
   }
 
+  // Builds the monthly role matrix below the chart.
   function buildMonthlyRoleMatrixHtml(trend) {
     const months = trend.months || [];
     const roles = trend.detailRoles || trend.roles || [];
@@ -2090,6 +2312,7 @@ ${buildCss()}
 </div>`;
   }
 
+  // Finds the maximum value across matrix cells for heatmap scaling.
   function getMaxMonthlyRoleMatrixValue(roles, months) {
     let maxValue = 1;
 
@@ -2102,6 +2325,7 @@ ${buildCss()}
     return maxValue;
   }
 
+  // Builds one clickable monthly role matrix cell.
   function buildMonthlyRoleMatrixCellHtml(role, month, roleIndex, monthIndex, maxMatrixCellValue) {
     const value = Number(role.countByMonth[month.key] || 0);
     if (!value) return '<td></td>';
@@ -2117,8 +2341,10 @@ ${buildCss()}
           </td>`;
   }
 
+  // Returns a heatmap style for a matrix cell based on value/maxValue.
   function getMonthlyMatrixHeatmapStyle(value, maxValue) {
     const ratio = Math.max(0, Math.min(1, Number(value || 0) / Math.max(1, Number(maxValue || 1))));
+    // Power curve gives small but non-zero values enough color to remain visible.
     const intensity = Math.pow(ratio, 0.38);
     const lowColor = '#f0a08d';
     const lowSoftColor = '#f8d2c6';
@@ -2144,6 +2370,7 @@ ${buildCss()}
       'color:' + textColor + ';box-shadow:inset 0 0 0 1px rgba(' + borderRgb.r + ',' + borderRgb.g + ',' + borderRgb.b + ',.28)';
   }
 
+  // Normalizes 3- or 6-digit hex colors.
   function normalizeHexColor(value, fallback) {
     const text = String(value || '').trim();
 
@@ -2155,6 +2382,7 @@ ${buildCss()}
     return fallback;
   }
 
+  // Mixes two colors by amount, where 0 is fromHex and 1 is toHex.
   function mixHexColors(fromHex, toHex, amount) {
     const from = hexToRgb(fromHex);
     const to = hexToRgb(toHex);
@@ -2167,6 +2395,7 @@ ${buildCss()}
     );
   }
 
+  // Converts hex color text into RGB components.
   function hexToRgb(hex) {
     const color = normalizeHexColor(hex, '#64748b').substring(1);
 
@@ -2177,12 +2406,14 @@ ${buildCss()}
     };
   }
 
+  // Converts RGB values to a clamped hex color.
   function rgbToHex(r, g, b) {
     return '#' + [r, g, b].map(value => {
       return Math.max(0, Math.min(255, value)).toString(16).padStart(2, '0');
     }).join('');
   }
 
+  // Chooses readable text colors for matrix heatmap cells.
   function getReadableMatrixTextColor(backgroundHex, intensity) {
     if (intensity < 0.24) return '#7c2d12';
     if (intensity > 0.68) return '#065f46';
@@ -2190,6 +2421,8 @@ ${buildCss()}
     return '#51483a';
   }
 
+  // Calculates relative luminance for a color. Kept for future accessibility
+  // tuning even though the current matrix uses intensity thresholds.
   function getColorLuminance(hex) {
     const rgb = hexToRgb(hex);
     const values = [rgb.r, rgb.g, rgb.b].map(value => {
@@ -2200,6 +2433,7 @@ ${buildCss()}
     return (0.2126 * values[0]) + (0.7152 * values[1]) + (0.0722 * values[2]);
   }
 
+  // Builds the subtitle above the employee detail table from filters/search stats.
   function buildResultSubtitle(data, filters) {
     const stats = data.stats || {};
     const pieces = [
@@ -2215,10 +2449,15 @@ ${buildCss()}
     return pieces.join(' | ');
   }
 
+  // Builds the main employee detail table, split into current-month and earlier
+  // sections for easier scanning.
   function buildTableHtml(rows) {
     if (!rows.length) {
       return `<div class="empty-chart">No employees matched the selected filters.</div>`;
     }
+    const currentMonthLabel = formatMonthTitle(new Date());
+    const currentMonthRows = rows.filter(row => row.currentMonthLogin);
+    const earlierRows = rows.filter(row => !row.currentMonthLogin);
 
     return `
 ${buildDetailTableFilterHtml(rows)}
@@ -2235,12 +2474,29 @@ ${buildDetailTableFilterHtml(rows)}
       </tr>
     </thead>
     <tbody>
-      ${rows.map(buildTableRowHtml).join('')}
+      ${currentMonthRows.length ? buildDetailMonthSectionRowHtml('current', 'Current Month - ' + currentMonthLabel, currentMonthRows.length) : ''}
+      ${currentMonthRows.map(buildTableRowHtml).join('')}
+      ${earlierRows.length ? buildDetailMonthSectionRowHtml('earlier', 'Previous Months / No Login', earlierRows.length) : ''}
+      ${earlierRows.map(buildTableRowHtml).join('')}
     </tbody>
   </table>
 </div>`;
   }
 
+  // Section header row used inside the detail table.
+  function buildDetailMonthSectionRowHtml(sectionKey, label, count) {
+    return `
+<tr class="month-section-row month-section-${escAttr(sectionKey)}" data-section-row="T" data-month-section="${escAttr(sectionKey)}">
+  <td colspan="6">
+    <div class="month-section-cell">
+      <span>${esc(label)}</span>
+      <b data-section-count="${escAttr(sectionKey)}">${esc(formatWholeNumber(count))} employee${count === 1 ? '' : 's'}</b>
+    </div>
+  </td>
+</tr>`;
+  }
+
+  // Sortable table header helper.
   function buildSortableTableHeaderHtml(label, sortKey, initialDirection) {
     const direction = initialDirection === 'asc' || initialDirection === 'desc' ? initialDirection : '';
     const ariaSort = direction === 'asc' ? 'ascending' : (direction === 'desc' ? 'descending' : 'none');
@@ -2253,6 +2509,7 @@ ${buildDetailTableFilterHtml(rows)}
         </th>`;
   }
 
+  // Builds client-side filters for the employee detail table.
   function buildDetailTableFilterHtml(rows) {
     const roleNames = buildDetailRoleOptions(rows);
 
@@ -2298,6 +2555,7 @@ ${buildDetailTableFilterHtml(rows)}
 </div>`;
   }
 
+  // Builds unique role options for the detail table role filter.
   function buildDetailRoleOptions(rows) {
     const roleMap = {};
 
@@ -2308,6 +2566,7 @@ ${buildDetailTableFilterHtml(rows)}
     return Object.keys(roleMap).sort((a, b) => a.localeCompare(b));
   }
 
+  // Renders one employee row in the main detail table.
   function buildTableRowHtml(row) {
     const status = getEmployeeStatus(row);
     const roleName = row.roleName || 'No successful login role';
@@ -2323,8 +2582,16 @@ ${buildDetailTableFilterHtml(rows)}
       status.text
     ].join(' ');
 
+    const rowClass = [
+      'employee-login-row',
+      weekendLogin ? 'weekend-login-row' : '',
+      row.currentMonthLogin ? 'current-month-login-row' : ''
+    ].filter(Boolean).join(' ');
+
+    // Data attributes support client-side sorting/filtering/export without
+    // recalculating row metadata in the browser.
     return `
-<tr class="${weekendLogin ? 'weekend-login-row' : ''}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-detail-search="${escAttr(searchText)}" data-role="${escAttr(roleName)}" data-status="${escAttr(status.className)}" data-login-state="${row.lastLoginDate ? 'logged' : 'never'}" data-stale="${row.stale ? 'T' : 'F'}" data-days="${escAttr(row.daysSinceLogin === null ? '' : row.daysSinceLogin)}" data-sort-employee="${escAttr(row.name || '')}" data-sort-last-login="${escAttr(lastLoginTime)}" data-sort-role="${escAttr(roleName)}" data-sort-days="${escAttr(daysSortValue)}" data-sort-status="${escAttr(status.text)}">
+<tr class="${escAttr(rowClass)}" data-current-month="${row.currentMonthLogin ? 'T' : 'F'}" data-weekend-login="${weekendLogin ? 'T' : 'F'}" data-detail-search="${escAttr(searchText)}" data-role="${escAttr(roleName)}" data-status="${escAttr(status.className)}" data-login-state="${row.lastLoginDate ? 'logged' : 'never'}" data-stale="${row.stale ? 'T' : 'F'}" data-days="${escAttr(row.daysSinceLogin === null ? '' : row.daysSinceLogin)}" data-sort-employee="${escAttr(row.name || '')}" data-sort-last-login="${escAttr(lastLoginTime)}" data-sort-role="${escAttr(roleName)}" data-sort-days="${escAttr(daysSortValue)}" data-sort-status="${escAttr(status.text)}">
   <td data-export-label="${escAttr(row.name || '')}">${buildEmployeeLink(row)}</td>
   <td data-export-label="${escAttr(row.email || '')}">${buildEmployeeEmailHtml(row)}</td>
   <td data-sort-value="${escAttr(lastLoginTime)}" data-export-label="${escAttr(row.lastLogin || 'Never logged in')}">${esc(row.lastLogin || 'Never logged in')}${weekendLogin ? `<span class="weekend-login-table-badge">${esc(weekendLoginLabel)}</span>` : ''}</td>
@@ -2334,6 +2601,7 @@ ${buildDetailTableFilterHtml(rows)}
 </tr>`;
   }
 
+  // Converts row flags into a display status pill.
   function getEmployeeStatus(row) {
     if (row.inactive) {
       return {
@@ -2355,10 +2623,12 @@ ${buildDetailTableFilterHtml(rows)}
     };
   }
 
+  // Department fallback helper.
   function getDepartmentName(row) {
     return String(row && row.departmentName ? row.departmentName : 'No Department');
   }
 
+  // Renders an employee record link with optional developer badge.
   function buildEmployeeLink(row) {
     if (!row.name) return '';
     const developerBadge = isDashboardDeveloperEmployee(row) ? buildDeveloperAdminBadgeHtml(true) : '';
@@ -2367,6 +2637,7 @@ ${buildDetailTableFilterHtml(rows)}
     return `<a class="table-link" href="${escAttr(row.employeeUrl)}" target="_blank" rel="noopener">${esc(row.name)}</a>${developerBadge}`;
   }
 
+  // Resolves the employee record URL for links. Failures fall back to plain text.
   function buildEmployeeUrl(id) {
     if (!id) return '';
 
@@ -2381,10 +2652,14 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // Builds the client-side script for auto refresh, CSV export, detail table
+  // filters/sorting, chart drilldowns, and employee popup behavior.
   function buildScript() {
     return `
 <script>
+  // Default table sort matches the server-rendered order: newest login first.
   var employeeLoginSortState = { key: 'lastLogin', direction: 'desc' };
+  // Auto-refresh timers and localStorage keys.
   var autoRefreshTimer = null;
   var autoRefreshCountdownTimer = null;
   var autoRefreshRemainingSeconds = 0;
@@ -2392,6 +2667,7 @@ ${buildDetailTableFilterHtml(rows)}
   var autoRefreshSecondsStorageKey = 'psiqEmployeeLastLoginAutoRefreshSeconds';
   var todayLoginSnapshotStorageKey = 'psiqEmployeeLastLoginTodaySnapshot';
 
+  // Submits the NetSuite form when possible so native filter fields are preserved.
   function refreshLoginReport(){
     if(document.forms && document.forms[0]){
       document.forms[0].submit();
@@ -2401,6 +2677,7 @@ ${buildDetailTableFilterHtml(rows)}
     window.location.reload();
   }
 
+  // Initializes the auto-refresh controls from localStorage.
   function initAutoRefreshControls(){
     var enabledInput = document.getElementById('autoRefreshEnabled');
     var frequencySelect = document.getElementById('autoRefreshFrequency');
@@ -2416,6 +2693,7 @@ ${buildDetailTableFilterHtml(rows)}
     scheduleAutoRefresh(enabledInput.checked, seconds);
   }
 
+  // Persists the user's auto-refresh settings and restarts timers.
   function updateAutoRefreshSettings(){
     var enabledInput = document.getElementById('autoRefreshEnabled');
     var frequencySelect = document.getElementById('autoRefreshFrequency');
@@ -2429,6 +2707,8 @@ ${buildDetailTableFilterHtml(rows)}
     scheduleAutoRefresh(enabledInput.checked, seconds);
   }
 
+  // Starts or stops auto refresh. A countdown interval updates the visible status
+  // while a timeout performs the actual refresh.
   function scheduleAutoRefresh(enabled, seconds){
     clearAutoRefreshTimers();
 
@@ -2450,6 +2730,7 @@ ${buildDetailTableFilterHtml(rows)}
     }, autoRefreshRemainingSeconds * 1000);
   }
 
+  // Clears both the refresh timeout and countdown interval.
   function clearAutoRefreshTimers(){
     if(autoRefreshTimer){
       window.clearTimeout(autoRefreshTimer);
@@ -2462,6 +2743,7 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // Updates the countdown label for auto refresh.
   function updateAutoRefreshCountdown(){
     if(autoRefreshRemainingSeconds <= 0){
       setAutoRefreshStatus('Refreshing...');
@@ -2471,11 +2753,13 @@ ${buildDetailTableFilterHtml(rows)}
     setAutoRefreshStatus('Next ' + formatAutoRefreshDuration(autoRefreshRemainingSeconds));
   }
 
+  // Safe setter for the auto-refresh status text.
   function setAutoRefreshStatus(text){
     var status = document.getElementById('autoRefreshStatus');
     if(status) status.textContent = text || '';
   }
 
+  // Only allow supported auto-refresh durations.
   function normalizeAutoRefreshSeconds(value){
     var seconds = Number(value || 300);
     var allowed = [60, 300, 900, 1800];
@@ -2483,6 +2767,7 @@ ${buildDetailTableFilterHtml(rows)}
     return allowed.indexOf(seconds) >= 0 ? seconds : 300;
   }
 
+  // Formats countdown seconds as M:SS.
   function formatAutoRefreshDuration(seconds){
     var safeSeconds = Math.max(0, Number(seconds || 0));
     var minutes = Math.floor(safeSeconds / 60);
@@ -2491,6 +2776,7 @@ ${buildDetailTableFilterHtml(rows)}
     return minutes + ':' + String(remainder).padStart(2, '0');
   }
 
+  // localStorage read helper. Some browser contexts block storage access.
   function getStoredValue(key){
     try {
       return window.localStorage ? window.localStorage.getItem(key) : '';
@@ -2499,6 +2785,7 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // localStorage write helper. Failures are intentionally ignored.
   function setStoredValue(key, value){
     try {
       if(window.localStorage) window.localStorage.setItem(key, value);
@@ -2507,12 +2794,15 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // Runs all browser-side setup after the dashboard markup is available.
   function initializeEmployeeLoginDashboard(){
     highlightNewTodayLoginMembers();
     initAutoRefreshControls();
     initEmployeeLoginPopupEvents();
   }
 
+  // Highlights employee tiles that are new compared with the previous refresh of
+  // today's role-detail panels.
   function highlightNewTodayLoginMembers(){
     var detail = document.getElementById('todayRoleDetail');
     if(!detail) return;
@@ -2525,6 +2815,7 @@ ${buildDetailTableFilterHtml(rows)}
     var canHighlight = previousSnapshot && previousSnapshot.snapshotKey === snapshotKey;
 
     if(canHighlight){
+      // Convert the previous list into a lookup map for O(1) membership tests.
       (previousSnapshot.employeeKeys || []).forEach(function(key){
         previousKeys[key] = true;
       });
@@ -2537,6 +2828,7 @@ ${buildDetailTableFilterHtml(rows)}
       currentKeys.push(key);
 
       if(canHighlight && !previousKeys[key]){
+        // Mark only employees not seen in the previous snapshot for the same day.
         employee.classList.add('new-login-member');
         employee.setAttribute('data-new-login-member', 'T');
         employee.setAttribute('title', 'New since the previous refresh');
@@ -2546,6 +2838,7 @@ ${buildDetailTableFilterHtml(rows)}
     writeTodayLoginSnapshot(snapshotKey, currentKeys);
   }
 
+  // Reads the previous today-login snapshot from localStorage.
   function readTodayLoginSnapshot(){
     var storedValue = getStoredValue(todayLoginSnapshotStorageKey);
     if(!storedValue) return null;
@@ -2557,6 +2850,7 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // Writes a deduplicated today-login snapshot for the next refresh.
   function writeTodayLoginSnapshot(snapshotKey, employeeKeys){
     var uniqueKeys = {};
     var snapshot = {
@@ -2574,6 +2868,7 @@ ${buildDetailTableFilterHtml(rows)}
     setStoredValue(todayLoginSnapshotStorageKey, JSON.stringify(snapshot));
   }
 
+  // Builds a stable role/employee key for today-login snapshot comparison.
   function buildTodayLoginEmployeeKey(employee){
     var panel = employee.closest ? employee.closest('.today-role-employee-list') : null;
     var role = panel ? (panel.getAttribute('data-export-role') || '') : '';
@@ -2585,15 +2880,19 @@ ${buildDetailTableFilterHtml(rows)}
     return role + '|' + employeeId;
   }
 
+  // Exports the main detail table.
   function exportEmployeeLoginCsv(){
     exportTableCsv('employeeLoginTable', 'employee_last_login.csv');
   }
 
+  // Exports a visible HTML table to CSV, skipping hidden section rows.
   function exportTableCsv(tableId, filename){
     var table = document.getElementById(tableId);
     if(!table) return;
 
     var rows = Array.prototype.slice.call(table.querySelectorAll('tr')).filter(function(row){
+      // Month section headers are visual grouping rows, not data rows.
+      if(row.getAttribute('data-section-row') === 'T') return false;
       return !row.parentElement || row.parentElement.tagName === 'THEAD' || row.style.display !== 'none';
     });
     if(!rows.length) return;
@@ -2607,6 +2906,7 @@ ${buildDetailTableFilterHtml(rows)}
     downloadCsv(csv, sanitizeCsvFilename(filename || tableId));
   }
 
+  // Exports employee tiles from a selected today/monthly role panel.
   function exportEmployeePanelCsv(panelId){
     var panel = document.getElementById(panelId);
     if(!panel) return;
@@ -2639,10 +2939,12 @@ ${buildDetailTableFilterHtml(rows)}
     downloadCsv(csv, sanitizeCsvFilename(title));
   }
 
+  // Escapes a value for CSV output.
   function escapeCsvCell(value){
     return '"' + String(value == null ? '' : value).replace(/"/g, '""').replace(/\\s+/g, ' ').trim() + '"';
   }
 
+  // Converts arbitrary titles into safe CSV filenames.
   function sanitizeCsvFilename(value){
     var filename = String(value || 'employee_logins').toLowerCase()
       .replace(/[^a-z0-9._-]+/g, '_')
@@ -2654,6 +2956,7 @@ ${buildDetailTableFilterHtml(rows)}
     return filename;
   }
 
+  // Triggers a client-side CSV download.
   function downloadCsv(csv, filename){
     var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     var link = document.createElement('a');
@@ -2665,6 +2968,7 @@ ${buildDetailTableFilterHtml(rows)}
     URL.revokeObjectURL(link.href);
   }
 
+  // Shows the matching KPI detail panel and marks the clicked KPI card active.
   function showKpiDetail(kpiId){
     var detail = document.getElementById('kpiDetailPanel');
     if(!detail) return;
@@ -2696,6 +3000,7 @@ ${buildDetailTableFilterHtml(rows)}
     if(foundPanel && detail.scrollIntoView) detail.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
+  // Shows employees for a selected department bucket.
   function showDepartmentEmployees(departmentIndex){
     var detail = document.getElementById('departmentEmployeeDetail');
     if(!detail) return;
@@ -2727,12 +3032,13 @@ ${buildDetailTableFilterHtml(rows)}
     if(foundPanel && detail.scrollIntoView) detail.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
+  // Sorts the main employee table and then restores month section grouping.
   function sortEmployeeLoginTable(sortKey){
     var table = document.getElementById('employeeLoginTable');
     if(!table || !table.tBodies || !table.tBodies.length) return;
 
     var tbody = table.tBodies[0];
-    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr.employee-login-row'));
     var direction = getNextEmployeeLoginSortDirection(sortKey);
 
     rows.sort(function(a, b){
@@ -2748,9 +3054,11 @@ ${buildDetailTableFilterHtml(rows)}
       direction: direction
     };
 
+    updateEmployeeLoginMonthSections();
     updateEmployeeLoginSortIndicators(sortKey, direction);
   }
 
+  // Alternates direction for repeated clicks; date/days default descending.
   function getNextEmployeeLoginSortDirection(sortKey){
     if(employeeLoginSortState && employeeLoginSortState.key === sortKey){
       return employeeLoginSortState.direction === 'asc' ? 'desc' : 'asc';
@@ -2759,6 +3067,7 @@ ${buildDetailTableFilterHtml(rows)}
     return sortKey === 'lastLogin' || sortKey === 'days' ? 'desc' : 'asc';
   }
 
+  // Comparator used by sortEmployeeLoginTable().
   function compareEmployeeLoginRows(a, b, sortKey, direction){
     var aValue = getEmployeeLoginSortValue(a, sortKey);
     var bValue = getEmployeeLoginSortValue(b, sortKey);
@@ -2778,6 +3087,7 @@ ${buildDetailTableFilterHtml(rows)}
       .localeCompare(String(b.getAttribute('data-sort-employee') || ''));
   }
 
+  // Reads typed sort values from row data attributes.
   function getEmployeeLoginSortValue(row, sortKey){
     if(sortKey === 'lastLogin') return Number(row.getAttribute('data-sort-last-login') || 0);
     if(sortKey === 'days') return Number(row.getAttribute('data-sort-days') || 999999);
@@ -2787,6 +3097,7 @@ ${buildDetailTableFilterHtml(rows)}
     return String(row.getAttribute('data-sort-employee') || '').toLowerCase();
   }
 
+  // Updates sort indicator arrows and aria-sort attributes.
   function updateEmployeeLoginSortIndicators(sortKey, direction){
     var table = document.getElementById('employeeLoginTable');
     if(!table) return;
@@ -2812,6 +3123,7 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // Applies client-side text/role/status/age filters to the main employee table.
   function filterEmployeeLoginTable(){
     var table = document.getElementById('employeeLoginTable');
     if(!table || !table.tBodies || !table.tBodies.length) return;
@@ -2820,7 +3132,7 @@ ${buildDetailTableFilterHtml(rows)}
     var roleFilter = (document.getElementById('detailRoleFilter') || {}).value || '';
     var statusFilter = (document.getElementById('detailStatusFilter') || {}).value || '';
     var ageFilter = (document.getElementById('detailAgeFilter') || {}).value || '';
-    var rows = Array.prototype.slice.call(table.tBodies[0].querySelectorAll('tr'));
+    var rows = Array.prototype.slice.call(table.tBodies[0].querySelectorAll('tr.employee-login-row'));
     var searchText = String(textFilter).toLowerCase();
     var visibleCount = 0;
 
@@ -2844,8 +3156,62 @@ ${buildDetailTableFilterHtml(rows)}
     });
 
     updateEmployeeLoginVisibleCount(visibleCount, rows.length);
+    updateEmployeeLoginMonthSections();
   }
 
+  // Reorders table rows back under the current-month and earlier section headers
+  // after sorting/filtering.
+  function updateEmployeeLoginMonthSections(){
+    var table = document.getElementById('employeeLoginTable');
+    if(!table || !table.tBodies || !table.tBodies.length) return;
+
+    var tbody = table.tBodies[0];
+    var currentSection = tbody.querySelector('tr[data-month-section="current"]');
+    var earlierSection = tbody.querySelector('tr[data-month-section="earlier"]');
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr.employee-login-row'));
+    var currentRows = rows.filter(function(row){
+      return row.getAttribute('data-current-month') === 'T';
+    });
+    var earlierRows = rows.filter(function(row){
+      return row.getAttribute('data-current-month') !== 'T';
+    });
+
+    appendEmployeeLoginMonthGroup(tbody, currentSection, currentRows);
+    appendEmployeeLoginMonthGroup(tbody, earlierSection, earlierRows);
+  }
+
+  // Appends a section header and its rows, hiding the header when no rows are
+  // visible after filtering.
+  function appendEmployeeLoginMonthGroup(tbody, sectionRow, rows){
+    var visibleCount = countVisibleEmployeeLoginRows(rows);
+
+    if(sectionRow){
+      sectionRow.style.display = visibleCount ? '' : 'none';
+      updateEmployeeLoginMonthSectionCount(sectionRow, visibleCount);
+      tbody.appendChild(sectionRow);
+    }
+
+    rows.forEach(function(row){
+      tbody.appendChild(row);
+    });
+  }
+
+  // Counts rows not hidden by table filters.
+  function countVisibleEmployeeLoginRows(rows){
+    return rows.reduce(function(count, row){
+      return count + (row.style.display === 'none' ? 0 : 1);
+    }, 0);
+  }
+
+  // Updates the visible count on a month section header.
+  function updateEmployeeLoginMonthSectionCount(sectionRow, visibleCount){
+    var count = sectionRow.querySelector('[data-section-count]');
+    if(!count) return;
+
+    count.textContent = formatClientWholeNumber(visibleCount) + ' employee' + (visibleCount === 1 ? '' : 's');
+  }
+
+  // Evaluates the detail table login-age filter.
   function matchesEmployeeLoginAgeFilter(ageFilter, days, stale, loginState){
     if(ageFilter === 'today') return days === 0;
     if(ageFilter === 'last7') return days !== null && days <= 7;
@@ -2856,6 +3222,7 @@ ${buildDetailTableFilterHtml(rows)}
     return true;
   }
 
+  // Updates the "X of Y shown" text for the detail table.
   function updateEmployeeLoginVisibleCount(visibleCount, totalCount){
     var count = document.getElementById('employeeLoginVisibleCount');
     if(!count) return;
@@ -2863,6 +3230,7 @@ ${buildDetailTableFilterHtml(rows)}
     count.textContent = formatClientWholeNumber(visibleCount) + ' of ' + formatClientWholeNumber(totalCount) + ' shown';
   }
 
+  // Clears all detail table filters.
   function clearEmployeeLoginFilters(){
     var textFilter = document.getElementById('detailTextFilter');
     var roleFilter = document.getElementById('detailRoleFilter');
@@ -2877,10 +3245,12 @@ ${buildDetailTableFilterHtml(rows)}
     filterEmployeeLoginTable();
   }
 
+  // Client-side whole-number formatter for count labels.
   function formatClientWholeNumber(value){
     return String(Number(value || 0)).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
   }
 
+  // Shows the employee panel for a selected today-role bar.
   function showTodayRoleEmployees(roleIndex){
     var detail = document.getElementById('todayRoleDetail');
     if(!detail) return;
@@ -2905,14 +3275,17 @@ ${buildDetailTableFilterHtml(rows)}
     if(detail.scrollIntoView) detail.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
+  // Shows the chart-backed monthly detail panel.
   function showMonthlyRoleEmployees(roleIndex, monthIndex){
     showMonthlyEmployeePanel('monthlyRoleEmployees' + roleIndex + '_' + monthIndex, 'chart', roleIndex, monthIndex);
   }
 
+  // Shows the matrix-backed monthly detail panel.
   function showMonthlyMatrixEmployees(roleIndex, monthIndex){
     showMonthlyEmployeePanel('monthlyMatrixEmployees' + roleIndex + '_' + monthIndex, 'matrix', roleIndex, monthIndex);
   }
 
+  // Shared monthly detail panel display/highlighting logic.
   function showMonthlyEmployeePanel(targetId, source, roleIndex, monthIndex){
     var detail = document.getElementById('monthlyRoleDetail');
     if(!detail) return;
@@ -2965,6 +3338,7 @@ ${buildDetailTableFilterHtml(rows)}
     if(foundPanel && detail.scrollIntoView) detail.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
+  // Opens the employee detail popup from a clicked employee tile.
   function openEmployeeLoginPopup(employee){
     var popup = document.getElementById('employeeLoginPopup');
     if(!popup || !employee) return;
@@ -2995,10 +3369,13 @@ ${buildDetailTableFilterHtml(rows)}
     setPopupText('employeePopupPeriod', period || 'Not available');
 
     if(developerBadge){
+      // Developer badge is shown only for configured developer identities.
       developerBadge.style.display = dashboardDeveloper ? 'inline-flex' : 'none';
     }
 
     if(serviceAccountBadge){
+      // Service account badge is shown for configured service domains or matching
+      // employee tile metadata.
       serviceAccountBadge.style.display = serviceAccount ? 'inline-flex' : 'none';
     }
 
@@ -3031,6 +3408,7 @@ ${buildDetailTableFilterHtml(rows)}
     if(closeButton && closeButton.focus) closeButton.focus();
   }
 
+  // Closes the employee detail popup.
   function closeEmployeeLoginPopup(){
     var popup = document.getElementById('employeeLoginPopup');
     if(!popup) return;
@@ -3039,11 +3417,13 @@ ${buildDetailTableFilterHtml(rows)}
     popup.setAttribute('aria-hidden', 'true');
   }
 
+  // Safe popup text setter.
   function setPopupText(id, text){
     var node = document.getElementById(id);
     if(node) node.textContent = text || '';
   }
 
+  // Sets the popup role field, preserving the Administrator badge treatment.
   function setPopupRole(role){
     var node = document.getElementById('employeePopupRole');
     var text = role || 'Not available';
@@ -3063,10 +3443,12 @@ ${buildDetailTableFilterHtml(rows)}
     node.textContent = text;
   }
 
+  // Client-side Administrator role check for popup-only rendering.
   function isPopupAdministratorRole(role){
     return String(role || '').replace(/\\s+/g, ' ').trim().toLowerCase() === 'administrator';
   }
 
+  // Adds popup close handlers once.
   function initEmployeeLoginPopupEvents(){
     var popup = document.getElementById('employeeLoginPopup');
     if(popup && !popup.getAttribute('data-popup-events-ready')){
@@ -3084,6 +3466,8 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // Defer initialization until DOM is ready when NetSuite loads the script before
+  // all inline HTML is parsed.
   if(document.readyState === 'loading'){
     document.addEventListener('DOMContentLoaded', initializeEmployeeLoginDashboard);
   } else {
@@ -3092,24 +3476,31 @@ ${buildDetailTableFilterHtml(rows)}
 </script>`;
   }
 
+  // Clamps NetSuite search page size to the supported range.
   function getPageSize() {
     const configured = Number(CONFIG.pageSize || 1000);
     return Math.max(5, Math.min(1000, configured));
   }
 
+  // Login Audit Trail status values vary by account/text, so success is inferred
+  // by checking for "success" in the status string.
   function isSuccessfulLoginStatus(status) {
     return String(status || '').toLowerCase().indexOf('success') >= 0;
   }
 
+  // NetSuite booleans frequently appear as true, T, or TRUE.
   function isTrueValue(value) {
     if (value === true) return true;
     return String(value || '').toUpperCase() === 'T' || String(value || '').toUpperCase() === 'TRUE';
   }
 
+  // Convenience wrapper for weekend detection when the value may be a NetSuite
+  // date string rather than a Date object.
   function isWeekendLoginValue(value) {
     return isWeekendDate(parseNsDateTime(value));
   }
 
+  // Returns true for Saturday/Sunday dates.
   function isWeekendDate(dateObj) {
     if (!dateObj || isNaN(dateObj.getTime())) return false;
 
@@ -3117,6 +3508,7 @@ ${buildDetailTableFilterHtml(rows)}
     return day === 0 || day === 6;
   }
 
+  // Returns a display label for weekend login dates.
   function getWeekendLoginLabel(value) {
     const dateObj = parseNsDateTime(value);
     if (!isWeekendDate(dateObj)) return '';
@@ -3124,6 +3516,9 @@ ${buildDetailTableFilterHtml(rows)}
     return dateObj.getDay() === 0 ? 'Sunday' : 'Saturday';
   }
 
+  // Parses NetSuite date/datetime values into JavaScript Dates. Search results can
+  // return Date objects, NetSuite-formatted date strings, or native-parseable
+  // strings depending on account/user settings.
   function parseNsDateTime(value) {
     if (!value) return null;
 
@@ -3145,6 +3540,7 @@ ${buildDetailTableFilterHtml(rows)}
     }
 
     try {
+      // Date-only parsing handles searches that omit the time portion.
       const parsedDate = format.parse({
         value: String(value),
         type: format.Type.DATE
@@ -3161,6 +3557,8 @@ ${buildDetailTableFilterHtml(rows)}
     return isNaN(nativeDate.getTime()) ? null : nativeDate;
   }
 
+  // Formats a Date for NetSuite search date filters, with a simple M/D/YYYY
+  // fallback for non-NetSuite parsing contexts.
   function formatSearchDate(dateObj) {
     try {
       return format.format({
@@ -3176,10 +3574,12 @@ ${buildDetailTableFilterHtml(rows)}
     }
   }
 
+  // Removes time-of-day for date comparisons.
   function stripTime(dateObj) {
     return new Date(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate());
   }
 
+  // Formats the generated timestamp shown in the dashboard top bar.
   function formatLastRefreshedText(value) {
     const refreshedAt = value ? new Date(value) : new Date();
 
@@ -3198,24 +3598,30 @@ ${buildDetailTableFilterHtml(rows)}
     ].join('/') + ' ' + hours + ':' + String(refreshedAt.getMinutes()).padStart(2, '0') + ' ' + suffix;
   }
 
+  // Formats whole-number counts with thousands separators.
   function formatWholeNumber(value) {
     return String(Number(value || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
+  // Formats a number to one decimal place and removes trailing .0.
   function formatOneDecimal(value) {
     const rounded = Math.round(Number(value || 0) * 10) / 10;
     return String(rounded).replace(/\.0$/, '');
   }
 
+  // Keeps generated SVG coordinates compact and stable.
   function roundSvgNumber(value) {
     return Math.round(Number(value || 0) * 100) / 100;
   }
 
+  // Truncates long labels while leaving a visible ellipsis.
   function truncateText(value, maxLen) {
     const text = String(value || '');
     return text.length > maxLen ? text.substring(0, maxLen - 3) + '...' : text;
   }
 
+  // Returns the dashboard CSS as an inline style tag. Embedding CSS keeps this
+  // Suitelet deployable as a single script file.
   function buildCss() {
     return `
 <style>
@@ -3447,6 +3853,15 @@ ${buildDetailTableFilterHtml(rows)}
 .result-table tr.weekend-login-row td:first-child{box-shadow:inset 4px 0 0 rgba(245,158,11,.58),inset 0 1px 0 rgba(245,158,11,.08),inset 0 -1px 0 rgba(245,158,11,.08);animation:weekendLoginRowPulse 2.4s ease-in-out infinite}
 .result-table tr:hover td{background:#f8fafc}
 .result-table tr.weekend-login-row:hover td{background:#fff7d6}
+.result-table tr.month-section-row td{background:#e0f2fe!important;border-top:2px solid #38bdf8;border-bottom:1px solid #bae6fd;color:#0f172a;padding:7px 10px;box-shadow:none!important}
+.month-section-cell{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.result-table tr.month-section-row span{font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:0}
+.result-table tr.month-section-row b{border:1px solid #7dd3fc;background:#f0f9ff;color:#075985;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:900;line-height:1;white-space:nowrap}
+.result-table tr.current-month-login-row td{background:#ecfeff;box-shadow:inset 0 1px 0 rgba(8,145,178,.08),inset 0 -1px 0 rgba(8,145,178,.08)}
+.result-table tr.current-month-login-row td:first-child{box-shadow:inset 4px 0 0 #0891b2,inset 0 1px 0 rgba(8,145,178,.08),inset 0 -1px 0 rgba(8,145,178,.08)}
+.result-table tr.current-month-login-row:hover td{background:#cffafe}
+.result-table tr.current-month-login-row.weekend-login-row td{background:#fff7d6}
+.result-table tr.current-month-login-row.weekend-login-row td:first-child{box-shadow:inset 4px 0 0 #0891b2,inset 7px 0 0 rgba(245,158,11,.54),inset 0 1px 0 rgba(245,158,11,.12),inset 0 -1px 0 rgba(245,158,11,.12);animation:weekendLoginRowPulse 2.4s ease-in-out infinite}
 .table-link{color:#2563eb;font-weight:800;text-decoration:none}
 .table-link:hover{text-decoration:underline}
 .weekend-login-table-badge{display:inline-block;margin-left:8px;border:1px solid #fcd34d;background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 7px;font-size:10px;font-weight:900;line-height:1;vertical-align:middle;animation:weekendLoginBadgePulse 1.8s ease-in-out infinite;transform-origin:center}
@@ -3477,8 +3892,10 @@ ${buildDetailTableFilterHtml(rows)}
 </style>`;
   }
 
+  // Escapes dynamic text before injecting it into INLINEHTML.
   function esc(value) {
     return String(value == null ? '' : value)
+      // Ampersand first prevents double-escaping entities created below.
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -3486,9 +3903,11 @@ ${buildDetailTableFilterHtml(rows)}
       .replace(/'/g, '&#039;');
   }
 
+  // Escapes values used in HTML attributes and inline handlers.
   function escAttr(value) {
     return esc(value).replace(/`/g, '&#096;');
   }
 
+  // SuiteScript entry point export.
   return { onRequest };
 });

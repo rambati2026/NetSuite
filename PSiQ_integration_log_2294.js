@@ -15,13 +15,22 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
   url,
   format
 ) => {
+  // Central configuration for the dashboard. Most account-specific values live
+  // here so the search, retry, and rendering functions can stay generic.
   const CONFIG = {
     // Primary custom record source for XX1S order response records.
     recordType: 'customrecord_xx1s_order_resp',
+    // Alternate custom record sources to try when the primary type is missing,
+    // invalid, or does not expose the response detail fields expected below.
     fallbackRecordTypes: ['customrecord_xx1s_order_records'],
+    // Deployment parameter support lets admins override the response record type
+    // without editing the script in each environment.
     recordTypeParameter: 'custscript_xx1s_response_record_type',
+    // URL parameter used by the troubleshooting source selector.
     recordTypeUrlParam: 'recordType',
 
+    // Field IDs used to read response data. Arrays are supported for fields that
+    // have differed between deployments or record-type versions.
     fields: {
       id: 'internalid',
       name: 'name',
@@ -34,24 +43,51 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       inactive: 'isinactive'
     },
 
+    // Drilldown paging is client-side; this controls how many already-rendered
+    // rows are shown at a time in the transaction table.
     drilldownPageSize: 100,
+    // Search page size is clamped later to NetSuite's 1000-row page maximum.
     searchPageSize: 1000,
-    queryLimit: 2000,
+    // Hard cap for response rows scanned during a dashboard load. This prevents
+    // accidental wide date ranges from exhausting Suitelet governance.
+    queryLimit: 1000,
+    // Default date handling. When defaultRangeDays is positive, it wins over the
+    // fixed month/day defaults.
+    defaultRangeDays: 30,
     defaultFromMonth: 2,
     defaultFromDay: 1,
+    // Display metadata shown in the Suitelet UI.
     dashboardTitle: 'Order Response Integration Monitor',
     developedBy: 'Ramakrishna Ambati',
-    version: '1.2.4',
+    version: '1.2.18',
+    // Account allowlist protects the dashboard from accidental deployment in an
+    // unrelated NetSuite account.
     allowedAccounts: ['5775522', '5775522_SB1', '5775522_SB2'],
+    // Date filtering in the NetSuite search is faster; post-filtering exists as
+    // a fallback when date fields/search filters behave differently.
     useSearchDateFilters: true,
-    useSearchDetailColumns: false,
+    // Detail columns avoid record.load() calls when the custom fields are valid
+    // searchable columns.
+    useSearchDetailColumns: true,
+    // Previous-period comparison is disabled by default because it doubles the
+    // response search work.
+    enablePreviousPeriodComparison: false,
+    previousPeriodComparisonMaxDays: 31,
+    // Transfer order status lookup can be expensive, so it is opt-in by default.
+    loadTransferOrderStatusByDefault: false,
+    // Retry controls both server-side retry writes and UI retry affordances.
     enableRetry: true,
+    // External retry Suitelet settings. The dashboard constructs links to this
+    // Suitelet when it can resolve a source transaction internal ID.
     retrySuitelet: {
       script: '1948',
       deploy: '1',
       companyId: '',
       orderIdParam: 'ordID'
     },
+    // Candidate fields used when the dashboard marks a response record for retry.
+    // The script chooses only fields that actually exist and match the expected
+    // field type on the configured custom record.
     retry: {
       flagFields: [
         'custrecord_xx1s_retry_requested',
@@ -82,17 +118,41 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         'custrecord_retry_note',
         'custrecord_retry_message'
       ]
-    }
+    },
+    // Batch size and minimum governance guardrail for optional TO status lookups.
+    transferOrderLookupBatchSize: 400,
+    transferOrderLookupMinUsage: 250
   };
+
+  // Cache transaction number -> internal ID lookups within one Suitelet request
+  // so duplicate retry URLs do not repeat transaction searches.
   const transactionInternalIdCache = {};
 
+  // Cache transfer order info by both internal ID and tranid; dashboard rows may
+  // reference either shape depending on the integration response message.
+  const transferOrderInfoCache = {};
+
+  // Canonical labels used after raw NetSuite status values are normalized.
+  const TRANSFER_ORDER_STATUS_LABELS = {
+    PENDING_FULFILLMENT: 'Pending Fulfillment',
+    PARTIALLY_FULFILLED: 'Partially Fulfilled',
+    CLOSED: 'Closed'
+  };
+
+  // Suitelet entry point. The script supports three modes:
+  // - dashboard: full NetSuite form with rendered HTML
+  // - data: JSON payload for diagnostics/future AJAX usage
+  // - retry: JSON response after marking a record for retry
   function onRequest(context) {
     assertAllowedAccount();
 
     const request = context.request;
     const response = context.response;
+    // Default to the full dashboard when no explicit action is supplied.
     const action = request.parameters.action || 'dashboard';
 
+    // JSON data endpoint. The UI currently renders server-side, but this endpoint
+    // is useful for debugging and gives a stable contract for future refreshes.
     if (action === 'data') {
       response.setHeader({ name: 'Content-Type', value: 'application/json' });
       try {
@@ -104,6 +164,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       return;
     }
 
+    // Retry endpoint. It returns JSON because the client-side retry action can be
+    // wired to fetch() without reloading the full dashboard.
     if (action === 'retry') {
       response.setHeader({ name: 'Content-Type', value: 'application/json' });
       response.write(JSON.stringify(handleRetry(request.parameters.id, request.parameters.recordType)));
@@ -113,6 +175,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     renderDashboard(request, response);
   }
 
+  // Blocks accidental execution outside the intended NetSuite accounts.
   function assertAllowedAccount() {
     const allowedAccounts = CONFIG.allowedAccounts || [];
 
@@ -121,6 +184,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Creates the Suitelet form and injects the entire dashboard into a single
+  // INLINEHTML field. This keeps deployment simple: no separate client script,
+  // CSS file, or File Cabinet asset is required.
   function renderDashboard(request, response) {
     const form = serverWidget.createForm({ title: CONFIG.dashboardTitle });
     const htmlField = form.addField({
@@ -129,6 +195,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       type: serverWidget.FieldType.INLINEHTML
     });
 
+    // Resolve the current script/deployment dynamically so links keep working
+    // after promotion between sandbox and production deployments.
     const suiteletUrl = url.resolveScript({
       scriptId: runtime.getCurrentScript().id,
       deploymentId: runtime.getCurrentScript().deploymentId,
@@ -137,9 +205,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
 
     let data;
     try {
+      // Build the initial payload synchronously so the first page load is fully
+      // usable without a browser-side data fetch.
       data = getDashboardData(request.parameters || {});
     } catch (e) {
       log.error({ title: 'Integration dashboard render failed', details: e });
+      // Render a friendly configuration/error page instead of failing the entire
+      // Suitelet response.
       data = buildErrorData(e, request.parameters || {});
     }
 
@@ -147,10 +219,15 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     response.writePage(form);
   }
 
+  // Main data pipeline: normalize filters, choose the response record source,
+  // fetch raw rows, normalize them into dashboard rows, optionally enrich them,
+  // and calculate all aggregates used by the HTML renderer.
   function getDashboardData(params) {
     const filters = normalizeDashboardFilters(params || {});
     const recordTypeInfo = getConfiguredRecordTypeInfo(params || {});
 
+    // Without a valid source record type, return a payload the UI can use to show
+    // configuration help and possible custom record candidates.
     if (!recordTypeInfo.recordType) {
       return buildConfigData(recordTypeInfo.message, filters, recordTypeInfo.rawRecordType, discoverRecordTypeCandidates());
     }
@@ -161,6 +238,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     try {
       rows = fetchRows(filters, selectedRecordType);
 
+      // If the configured source returns rows but no response details, it is
+      // probably the wrong custom record type; try the configured fallbacks.
       if (!rows.length || !rowsHaveResponseDetails(rows)) {
         const fallbackRecordType = findFallbackRecordTypeWithRows(filters, selectedRecordType);
 
@@ -176,6 +255,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         selectedRecordType = fallbackRecordType.recordType;
         rows = fallbackRecordType.rows;
       } else if (isInvalidRecordTypeError(e)) {
+        // Invalid search type is common during setup; return actionable help
+        // instead of throwing a Suitelet error page.
         return buildConfigData(
           'Invalid custom record type: ' + recordTypeInfo.recordType + '. Open the custom record type in NetSuite and use its exact Internal ID, then set CONFIG.recordType or deployment parameter ' + CONFIG.recordTypeParameter + '.',
           filters,
@@ -189,13 +270,34 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       }
     }
 
+    // Preserve searchStats from the raw result array before mapping it into
+    // normalized row objects.
     const searchStats = rows.searchStats || buildEmptySearchStats();
     const normalized = rows.map(row => normalizeRow(row, selectedRecordType));
-    const viewRows = applyResultFilters(buildViewRows(normalized, filters.viewMode), filters);
+    // Current view collapses repeated responses per transaction; history view
+    // keeps every response row and marks failures resolved by later successes.
+    const baseViewRows = buildViewRows(normalized, filters.viewMode);
+    // Apply cheap filters before optional TO status enrichment so fewer transfer
+    // order lookups are needed.
+    const filteredBaseViewRows = applyResultFilters(baseViewRows, withoutTransferOrderStatusFilter(filters));
+    const shouldLoadToStatus = shouldLoadTransferOrderStatus(filters);
+    const rowsWithOptionalTransferOrderInfo = shouldLoadToStatus ?
+      enrichRowsWithTransferOrderInfo(filteredBaseViewRows) :
+      filteredBaseViewRows;
+    // Apply the full filter set after enrichment so TO status filters work only
+    // when that data has been loaded.
+    const viewRows = applyResultFilters(rowsWithOptionalTransferOrderInfo, filters);
     const drilldownRows = buildViewDrilldownRows(viewRows, filters.viewMode);
     const summary = buildSummary(viewRows);
-    const previousPeriod = fetchPreviousPeriodSummary(filters, selectedRecordType);
-    summary.comparison = buildSummaryComparison(summary, previousPeriod.summary, previousPeriod.filters);
+    summary.toStatusLoaded = shouldLoadToStatus;
+    // Comparison stays an object even when disabled so renderer code can be
+    // simple and null-safe.
+    summary.comparison = {};
+
+    if (shouldFetchPreviousPeriodComparison(filters)) {
+      const previousPeriod = fetchPreviousPeriodSummary(filters, selectedRecordType);
+      summary.comparison = buildSummaryComparison(summary, previousPeriod.summary, previousPeriod.filters);
+    }
 
     return {
       generatedAt: new Date().toISOString(),
@@ -214,6 +316,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Verifies that a raw search result has enough useful detail columns to drive
+  // the dashboard. This is also used to decide whether fallback sources are worth
+  // trying.
   function rowsHaveResponseDetails(rows) {
     return (rows || []).some(r => {
       return r.transaction_type ||
@@ -223,6 +328,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     });
   }
 
+  // Tries each configured fallback custom record type until one returns rows with
+  // response details. Failures are logged and skipped so one bad fallback does not
+  // break the primary dashboard.
   function findFallbackRecordTypeWithRows(filters, currentRecordType) {
     const fallbackRecordTypes = CONFIG.fallbackRecordTypes || [];
 
@@ -251,6 +359,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return null;
   }
 
+  // Builds a complete but empty payload for configuration issues, letting the
+  // dashboard render setup help with the same component path as normal data.
   function buildConfigData(message, filters, recordType, candidates) {
     return {
       generatedAt: new Date().toISOString(),
@@ -265,7 +375,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         unknown: 0,
         successRate: 0,
         failureRate: 0,
-        topCategory: 'None'
+        topCategory: 'None',
+        toPendingFulfillment: 0,
+        toPartiallyFulfilled: 0,
+        toClosed: 0,
+        toStatusLoaded: false
       },
       insights: buildInsights([]),
       searchStats: buildEmptySearchStats(),
@@ -279,6 +393,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Builds a complete but empty payload for runtime errors so the UI can display
+  // the error banner and still show filters/source guidance.
   function buildErrorData(error, params) {
     const filters = normalizeDashboardFilters(params || {});
 
@@ -295,7 +411,11 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         unknown: 0,
         successRate: 0,
         failureRate: 0,
-        topCategory: 'None'
+        topCategory: 'None',
+        toPendingFulfillment: 0,
+        toPartiallyFulfilled: 0,
+        toClosed: 0,
+        toStatusLoaded: false
       },
       insights: buildInsights([]),
       searchStats: buildEmptySearchStats(),
@@ -309,11 +429,16 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Determines the custom record type in priority order: script configuration,
+  // deployment parameter, then URL parameter. The final value is validated before
+  // it is passed into NetSuite search APIs.
   function getConfiguredRecordTypeInfo(params) {
     let rawRecordType = '';
     params = params || {};
 
     try {
+      // Deployment parameters may not exist in every environment, so failure is
+      // treated as "no override" rather than fatal.
       rawRecordType = runtime.getCurrentScript().getParameter({
         name: CONFIG.recordTypeParameter
       }) || '';
@@ -347,6 +472,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Searches NetSuite custom-record metadata for likely response-record sources.
+  // Multiple query shapes are attempted because account/query casing can differ.
   function discoverRecordTypeCandidates() {
     const queries = [
       "SELECT scriptid, name FROM customrecordtype WHERE isinactive = 'F' ORDER BY name",
@@ -367,6 +494,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return [];
   }
 
+  // Ranks metadata candidates by terms that are likely to appear in this
+  // integration's response custom record type.
   function rankRecordTypeCandidates(rows) {
     const terms = ['xx1s', 'order', 'response', 'integration', 'sanmina'];
 
@@ -386,29 +515,129 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .slice(0, 12);
   }
 
+  // Normalizes all dashboard filters from query-string values, applying safe
+  // defaults when a parameter is missing or unsupported.
   function normalizeDashboardFilters(params) {
     const defaults = getDefaultDateRange();
+
+    const toStatus = shouldApplyTransferOrderStatusFilter(params) ?
+      normalizeTransferOrderStatusFilter(params.toStatus) :
+      'ALL';
 
     return {
       dateFrom: isIsoDate(params.dateFrom) ? params.dateFrom : defaults.dateFrom,
       dateTo: isIsoDate(params.dateTo) ? params.dateTo : defaults.dateTo,
       viewMode: normalizeViewMode(params.viewMode || params.mode),
-      status: params.status || 'ALL',
-      category: params.category || 'ALL',
+      status: normalizeIntegrationStatusFilter(params.status),
+      category: normalizeIntegrationCategoryFilter(params.category),
+      toStatus,
+      loadToStatus: normalizeTransferOrderLoadFlag(params.loadToStatus, toStatus),
       search: String(params.search || '').trim()
     };
   }
 
+  // Dashboard modes: CURRENT collapses to latest state, HISTORY keeps all rows.
   function normalizeViewMode(value) {
     return String(value || '').toUpperCase() === 'HISTORY' ? 'HISTORY' : 'CURRENT';
   }
 
+  // Limits status filters to statuses this script knows how to infer.
+  function normalizeIntegrationStatusFilter(value) {
+    const status = String(value || '').trim().toUpperCase();
+
+    return status === 'SUCCESS' || status === 'FAILED' || status === 'UNKNOWN' ? status : 'ALL';
+  }
+
+  // Limits category filters to the categories generated by inferCategory().
+  function normalizeIntegrationCategoryFilter(value) {
+    const category = String(value || '').trim().toUpperCase();
+    const allowedCategories = {
+      PRICE_LIST: true,
+      UOM_CONVERSION: true,
+      ITEM_XREF: true,
+      VALIDATION: true,
+      ORDER_TYPE: true,
+      OTHER_ERROR: true,
+      UNKNOWN: true
+    };
+
+    return allowedCategories[category] ? category : 'ALL';
+  }
+
+  // Accepts human/raw NetSuite TO status values and returns the canonical status
+  // key used by filters, counts, pills, and CSS classes.
+  function normalizeTransferOrderStatusFilter(value) {
+    const rawValue = String(value || '').trim();
+    if (!rawValue || rawValue.toUpperCase() === 'ALL') return 'ALL';
+
+    const statusKey = normalizeTransferOrderStatusKey(rawValue);
+    return isTrackedTransferOrderStatusKey(statusKey) ? statusKey : 'ALL';
+  }
+
+  // TO status is only treated as a result filter when the URL explicitly marks it
+  // as a filter. This prevents the Load TO Status button from accidentally
+  // narrowing results.
+  function shouldApplyTransferOrderStatusFilter(params) {
+    const mode = String(params && params.toStatusMode || '').trim().toUpperCase();
+
+    return mode === 'FILTER';
+  }
+
+  // Normalizes common truthy URL/form values into a boolean.
+  function normalizeBooleanFlag(value) {
+    const text = String(value || '').trim().toUpperCase();
+    return text === 'T' || text === 'TRUE' || text === 'Y' || text === 'YES' || text === '1';
+  }
+
+  // Determines whether TO status should be loaded at all. "ALL" means load TO
+  // statuses for display without applying a specific status filter.
+  function normalizeTransferOrderLoadFlag(value, toStatus) {
+    const text = String(value || '').trim().toUpperCase();
+
+    if (text === 'ALL') return true;
+    if (!toStatus || toStatus === 'ALL') return false;
+
+    return normalizeBooleanFlag(value);
+  }
+
+  // Central switch for optional TO status enrichment.
+  function shouldLoadTransferOrderStatus(filters) {
+    return !!CONFIG.loadTransferOrderStatusByDefault ||
+      !!(filters && filters.loadToStatus) ||
+      !!(filters && filters.toStatus && filters.toStatus !== 'ALL');
+  }
+
+  // Previous-period comparison can be expensive, so it is gated by configuration
+  // and by a maximum selected range length.
+  function shouldFetchPreviousPeriodComparison(filters) {
+    if (!CONFIG.enablePreviousPeriodComparison) return false;
+
+    const start = isoDateBoundary(filters.dateFrom, false);
+    const end = isoDateBoundary(filters.dateTo, false);
+    const maxDays = Number(CONFIG.previousPeriodComparisonMaxDays || 31);
+
+    return getDateRangeDays(start, end) <= maxDays;
+  }
+
+  // Computes the default dashboard date range using the configured rolling range
+  // or, when disabled, a fixed month/day start.
   function getDefaultDateRange() {
     const today = new Date();
     const to = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-    const from = new Date(to.getFullYear(), Number(CONFIG.defaultFromMonth || 2) - 1, Number(CONFIG.defaultFromDay || 1));
+    let from;
+
+    if (Number(CONFIG.defaultRangeDays || 0) > 0) {
+      // Use an inclusive rolling range. Example: 30 days includes today and the
+      // prior 29 days.
+      from = new Date(to);
+      from.setDate(to.getDate() - Number(CONFIG.defaultRangeDays || 30) + 1);
+    } else {
+      from = new Date(to.getFullYear(), Number(CONFIG.defaultFromMonth || 2) - 1, Number(CONFIG.defaultFromDay || 1));
+    }
 
     if (from > to) {
+      // If the fixed default date is later than today, assume it belongs to the
+      // previous year so the range is still valid.
       from.setFullYear(from.getFullYear() - 1);
     }
 
@@ -418,6 +647,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Fetches response records for the selected range and attaches search metadata
+  // onto the returned array for later warning/diagnostic display.
   function fetchRows(filters, recordType) {
     const fromDate = isoDateBoundary(filters.dateFrom, false);
     const toDate = isoDateBoundary(filters.dateTo, true);
@@ -432,6 +663,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return rows;
   }
 
+  // Applies status/category/TO-status/search filters to already-normalized rows.
+  // This is used both before and after optional transfer-order enrichment.
   function applyResultFilters(rows, filters) {
     let filteredRows = (rows || []).slice();
 
@@ -443,6 +676,10 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       filteredRows = filteredRows.filter(r => r.category === filters.category);
     }
 
+    if (filters.toStatus && filters.toStatus !== 'ALL') {
+      filteredRows = filteredRows.filter(r => r.transferOrderStatusKey === filters.toStatus);
+    }
+
     if (filters.search) {
       const s = String(filters.search || '').toLowerCase();
       filteredRows = filteredRows.filter(r => buildNormalizedRowSearchText(r).indexOf(s) >= 0);
@@ -451,6 +688,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return filteredRows;
   }
 
+  // Builds a single lowercase search blob for global filtering. Keeping it in one
+  // helper ensures server-side and future client-side filtering use the same row
+  // fields.
   function buildNormalizedRowSearchText(row) {
     return [
       row.id,
@@ -463,6 +703,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       row.severity,
       row.priority,
       row.failureFingerprint,
+      row.transferOrderNumber,
+      row.transferOrderStatus,
+      row.transferOrderStatusKey,
       row.returnMessage,
       row.sanminaOrderNumber,
       row.purchaseOrderId,
@@ -470,6 +713,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     ].join(' ').toLowerCase();
   }
 
+  // Wrapper around the search implementation with graceful fallback paths for
+  // environments where detail columns or date filters are not searchable.
   function fetchRowsFromSearch(recordType, fromDate, toDate) {
     const includeDetailColumns = !!CONFIG.useSearchDetailColumns;
 
@@ -477,6 +722,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       return fetchRowsFromSearchInternal(recordType, fromDate, toDate, includeDetailColumns, !!CONFIG.useSearchDateFilters);
     } catch (e) {
       if (includeDetailColumns) {
+        // First fallback: remove custom detail columns and load details from the
+        // record only when needed.
         log.error({
           title: 'Integration response detail column search failed; falling back to record.load()',
           details: e
@@ -485,6 +732,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         try {
           return fetchRowsFromSearchInternal(recordType, fromDate, toDate, false, !!CONFIG.useSearchDateFilters);
         } catch (dateFilterError) {
+          // Second fallback: also remove the date search filters and do date
+          // filtering in JavaScript after reading each row's created date.
           log.error({
             title: 'Integration response date-filtered search failed; falling back to post-filtering',
             details: dateFilterError
@@ -494,6 +743,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         }
       }
 
+      // If detail columns were already disabled, the only remaining fallback is
+      // post-filtering by date after a broader search.
       log.error({
         title: 'Integration response date-filtered search failed; falling back to post-filtering',
         details: e
@@ -503,8 +754,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Performs the actual NetSuite search and pushes raw response row objects into
+  // a result array. It can operate in fast mode with detail columns, or in safe
+  // mode where details are loaded per record.
   function fetchRowsFromSearchInternal(recordType, fromDate, toDate, includeDetailColumns, useDateFilters) {
     const f = CONFIG.fields;
+    // Sort by internal ID descending so the newest/highest records are scanned
+    // first when queryLimit is reached.
     const colId = search.createColumn({ name: f.id, sort: search.Sort.DESC });
     const colName = search.createColumn({ name: f.name });
     const colCreated = search.createColumn({ name: f.created });
@@ -519,6 +775,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       columns: searchColumns
     });
 
+    // runPagedSearch stops early when the callback returns false, which enforces
+    // CONFIG.queryLimit without fetching unnecessary pages.
     const completed = runPagedSearch(responseSearch, result => {
       scanned += 1;
       processResponseSearchResult({
@@ -538,6 +796,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       return scanned < CONFIG.queryLimit;
     });
 
+    // Array metadata is intentionally attached after population. Callers preserve
+    // it before mapping rows into normalized objects.
     rows.searchStats = {
       scanned,
       queryLimit: CONFIG.queryLimit,
@@ -549,6 +809,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return rows;
   }
 
+  // Builds the base response custom-record search filters. Date filters can be
+  // disabled so fetchRowsFromSearchInternal can post-filter when needed.
   function buildResponseSearchFilters(fromDate, toDate, useDateFilters) {
     const f = CONFIG.fields;
     const filters = [[f.inactive, 'is', 'F']];
@@ -565,18 +827,24 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return filters;
   }
 
+  // Converts one NetSuite search result into the raw shape consumed by
+  // normalizeRow(). Missing detail values trigger a record.load() fallback.
   function processResponseSearchResult(options) {
     const result = options.result;
     const id = result.getValue(options.colId);
     const created = result.getValue(options.colCreated);
     const createdDate = parseNsDateTime(created);
 
+    // When date filters cannot be used in the search itself, enforce the range
+    // here before spending governance on record.load().
     if (!options.useDateFilters && (!createdDate || createdDate < options.fromDate || createdDate > options.toDate)) {
       return;
     }
 
     let responseValues = options.includeDetailColumns ? readResponseSearchDetailValues(result, options.detailColumns) : {};
 
+    // Some custom fields may not be searchable or may return blank text from a
+    // result column. Loading the record gives a second chance to read values.
     if (!rowsHaveResponseDetails([responseValues])) {
       responseValues = loadResponseRecordValues(options.recordType, id);
     }
@@ -590,6 +858,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }, responseValues));
   }
 
+  // Iterates every page in a NetSuite paged search and allows callers to stop
+  // early by returning false from eachResult.
   function runPagedSearch(responseSearch, eachResult) {
     const pagedData = responseSearch.runPaged({
       pageSize: getSearchPageSize()
@@ -608,11 +878,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return true;
   }
 
+  // Keeps the configured page size inside NetSuite's legal range.
   function getSearchPageSize() {
     const configuredPageSize = Number(CONFIG.searchPageSize || 1000);
     return Math.max(5, Math.min(1000, configuredPageSize));
   }
 
+  // Formats JavaScript Date values for NetSuite date search filters, falling
+  // back to ISO date when the NetSuite formatter is unavailable.
   function formatSearchDate(dateObj) {
     try {
       return format.format({
@@ -624,6 +897,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Builds search columns for optional detail reads. Each logical output field
+  // can map to multiple candidate custom field IDs.
   function buildResponseSearchDetailColumns() {
     const f = CONFIG.fields;
     return [
@@ -640,10 +915,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     });
   }
 
+  // Flattens grouped detail column definitions into the column list accepted by
+  // search.create().
   function flattenDetailColumns(detailColumns) {
     return detailColumns.reduce((cols, def) => cols.concat(def.columns), []);
   }
 
+  // Reads all configured detail columns from a search result into a plain raw row
+  // object.
   function readResponseSearchDetailValues(result, detailColumns) {
     const values = {};
 
@@ -651,6 +930,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       values[def.key] = readFirstSearchColumnValue(result, def.columns);
 
       if (def.key === 'purchase_order') {
+        // Keep the raw purchase-order value separately because getText() may
+        // return a display value while retry/TO lookup needs the internal ID.
         values.purchase_order_id = readFirstSearchColumnRawValue(result, def.columns);
       }
     });
@@ -658,6 +939,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return values;
   }
 
+  // Reads the first non-empty display text/value from a list of candidate search
+  // columns, shielding callers from field-level getText/getValue failures.
   function readFirstSearchColumnValue(result, columns) {
     for (let i = 0; i < columns.length; i++) {
       try {
@@ -682,6 +965,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Reads the first non-empty raw value from candidate search columns. Used when
+  // the internal ID matters more than display text.
   function readFirstSearchColumnRawValue(result, columns) {
     for (let i = 0; i < columns.length; i++) {
       try {
@@ -698,10 +983,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Coerces a single field ID or array of field IDs into a clean array.
   function normalizeFieldIdList(fieldIds) {
     return (Array.isArray(fieldIds) ? fieldIds : [fieldIds]).filter(Boolean);
   }
 
+  // Loads a response custom record when search columns are missing or incomplete.
+  // It first uses configured field IDs, then auto-detects likely fields by label
+  // and value pattern when needed.
   function loadResponseRecordValues(recordType, id) {
     const f = CONFIG.fields;
 
@@ -723,6 +1012,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
         detectResponseRecordValues(responseRecord) :
         buildEmptyDetectedResponseValues();
 
+      // Prefer explicitly configured fields. Auto-detected values only fill gaps.
       return {
         owner: configuredValues.owner || detectedValues.owner,
         transaction_type: configuredValues.transaction_type || detectedValues.transaction_type,
@@ -748,6 +1038,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Determines whether the loaded record should be scanned for likely response
+  // fields because one or more configured fields came back blank.
   function needsResponseAutoDetection(configuredValues) {
     return !configuredValues.transaction_type ||
       !configuredValues.return_message ||
@@ -755,6 +1047,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       !configuredValues.purchase_order;
   }
 
+  // Empty auto-detection shape keeps merging logic simple.
   function buildEmptyDetectedResponseValues() {
     return {
       owner: '',
@@ -766,6 +1059,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Guesses response fields by inspecting field IDs, labels, and value content.
+  // This makes the dashboard more resilient when custom field IDs vary by
+  // account or version.
   function detectResponseRecordValues(responseRecord) {
     const candidates = buildFieldCandidates(responseRecord);
 
@@ -792,6 +1088,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Builds searchable field candidates from the loaded response record.
   function buildFieldCandidates(responseRecord) {
     let fieldIds = [];
 
@@ -814,6 +1111,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }).filter(c => c.value !== '');
   }
 
+  // Safely reads a field label. Some fields may not expose metadata to the role
+  // running the Suitelet.
   function getRecordFieldLabel(responseRecord, fieldId) {
     try {
       const field = responseRecord.getField({ fieldId });
@@ -823,6 +1122,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Returns the first candidate whose predicate matches and whose value is not
+  // blank.
   function findCandidateValue(candidates, tests) {
     for (let i = 0; i < tests.length; i++) {
       const match = candidates.find(tests[i]);
@@ -835,14 +1136,17 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Tests whether a normalized field id/label contains one token.
   function hasFieldToken(candidate, token) {
     return candidate.matchText.indexOf(normalizeMatchText(token)) >= 0;
   }
 
+  // Tests whether a candidate contains every required token.
   function hasFieldTokens(candidate, tokens) {
     return tokens.every(token => hasFieldToken(candidate, token));
   }
 
+  // Heuristic for field values that look like integration response messages.
   function looksLikeResponseMessage(value) {
     const text = normalizeMatchText(value);
     return text.indexOf('error message') >= 0 ||
@@ -853,6 +1157,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       text.indexOf('not on price list') >= 0;
   }
 
+  // Heuristic for fields whose value appears to reference a PO/TO/SO/WO.
   function looksLikeOrderReference(value) {
     const text = normalizeMatchText(value);
     return text.indexOf('transfer order #') >= 0 ||
@@ -861,6 +1166,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       /^po\d+$/i.test(String(value || '').trim());
   }
 
+  // Safely reads text first and raw value second from one or more record fields.
   function safeRecordValue(responseRecord, fieldIds) {
     const ids = Array.isArray(fieldIds) ? fieldIds : [fieldIds];
 
@@ -893,6 +1199,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Safely reads only raw values from one or more record fields. This is used
+  // where internal IDs are needed for lookups or retry links.
   function safeRecordRawValue(responseRecord, fieldIds) {
     const ids = Array.isArray(fieldIds) ? fieldIds : [fieldIds];
 
@@ -915,12 +1223,15 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Identifies invalid custom record source errors from NetSuite search.
   function isInvalidRecordTypeError(error) {
     const name = String(error && error.name ? error.name : '');
     const message = String(error && error.message ? error.message : error);
     return name === 'INVALID_SEARCH_TYPE' || message.indexOf('Invalid search type') >= 0;
   }
 
+  // Converts one raw response row into the normalized dashboard row shape used by
+  // summaries, filters, chart builders, and the drilldown table.
   function normalizeRow(row, recordType) {
     const status = inferStatus(row.return_message);
     const category = inferCategory(row.return_message);
@@ -930,6 +1241,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     const purchaseOrderId = status === 'FAILED' ?
       resolveRetryOrderInternalId(row) :
       normalizeInternalId(row.purchase_order_id || row.purchase_order);
+    // Retry links are only useful for failed records that can be tied back to a
+    // transaction internal ID.
     const retryUrl = status === 'FAILED' ? buildOrderRetryUrl(purchaseOrderId) : '';
 
     return {
@@ -950,12 +1263,19 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       sanminaOrderNumber: row.sanmina_order_number || '',
       purchaseOrder: row.purchase_order || '',
       purchaseOrderId,
+      transferOrderId: '',
+      transferOrderNumber: '',
+      transferOrderStatus: '',
+      transferOrderStatusKey: '',
+      transferOrderUrl: '',
       retryUrl,
       resolvedBySuccess: false,
       retryable: status === 'FAILED'
     };
   }
 
+  // Resolves a NetSuite record URL for links in the dashboard. Failures return an
+  // empty string so the table can display plain text instead.
   function buildRecordUrl(recordType, id) {
     if (!recordType || !id) return '';
 
@@ -970,6 +1290,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Infers integration response status from the return message text.
   function inferStatus(message) {
     const msg = String(message || '').toUpperCase();
     if (msg.indexOf('ERROR') >= 0 || msg.indexOf('FAILED') >= 0 || msg.indexOf('FAILURE') >= 0 || msg.indexOf('EXCEPTION') >= 0) return 'FAILED';
@@ -977,6 +1298,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return 'UNKNOWN';
   }
 
+  // Classifies common failure messages into dashboard categories.
   function inferCategory(message) {
     const msg = String(message || '').toUpperCase();
     if (msg.indexOf('ITEM NOT ON PRICE LIST') >= 0) return 'PRICE_LIST';
@@ -989,6 +1311,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return 'UNKNOWN';
   }
 
+  // Maps categories/message content to a human severity label.
   function inferSeverity(category, message, status) {
     const msg = String(message || '').toUpperCase();
 
@@ -1000,6 +1323,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return 'Low';
   }
 
+  // Converts severity into a simple support priority.
   function inferPriority(severity) {
     const priorities = {
       Critical: 'P1',
@@ -1012,6 +1336,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return priorities[severity] || 'P4';
   }
 
+  // Groups similar failure messages by replacing volatile values like order
+  // numbers and dates, then truncating the result to a readable label.
   function buildFailureFingerprint(message, category) {
     const matchText = normalizeMatchText(message);
 
@@ -1034,22 +1360,26 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return truncateText(formatFingerprintLabel(cleaned || formatCategoryName(category)), 78);
   }
 
+  // Ensures fingerprint labels have a stable fallback and readable casing.
   function formatFingerprintLabel(value) {
     const text = String(value || '').trim();
     if (!text) return 'Unclassified failure';
     return text.charAt(0).toUpperCase() + text.slice(1);
   }
 
+  // Builds a normalized key for grouping similar fingerprints.
   function normalizeFingerprintKey(value) {
     return normalizeMatchText(value).replace(/\b\d+\b/g, '#');
   }
 
+  // Computes KPI counts and rates from the current view rows.
   function buildSummary(rows) {
     const total = rows.length;
     const success = rows.filter(r => r.status === 'SUCCESS').length;
     const failed = rows.filter(r => r.status === 'FAILED').length;
     const unknown = rows.filter(r => r.status === 'UNKNOWN').length;
     const categories = buildCategoryBreakdown(rows);
+    const transferOrderStatuses = buildTransferOrderStatusCounts(rows);
 
     return {
       total,
@@ -1058,19 +1388,60 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       unknown,
       successRate: total ? Math.round((success / total) * 1000) / 10 : 0,
       failureRate: total ? Math.round((failed / total) * 1000) / 10 : 0,
-      topCategory: categories.length ? categories[0].category : 'None'
+      topCategory: categories.length ? categories[0].category : 'None',
+      toPendingFulfillment: transferOrderStatuses.PENDING_FULFILLMENT,
+      toPartiallyFulfilled: transferOrderStatuses.PARTIALLY_FULFILLED,
+      toClosed: transferOrderStatuses.CLOSED
     };
   }
 
+  // Counts each tracked transfer order status once per unique transfer order.
+  function buildTransferOrderStatusCounts(rows) {
+    const counts = {
+      PENDING_FULFILLMENT: 0,
+      PARTIALLY_FULFILLED: 0,
+      CLOSED: 0
+    };
+    const seenTransferOrders = {};
+
+    (rows || []).forEach(row => {
+      const statusKey = row.transferOrderStatusKey;
+      if (!isTrackedTransferOrderStatusKey(statusKey)) return;
+
+      const transferOrderKey = buildTransferOrderUniqueKey(row);
+      if (!transferOrderKey || seenTransferOrders[transferOrderKey]) return;
+
+      seenTransferOrders[transferOrderKey] = true;
+      counts[statusKey] += 1;
+    });
+
+    return counts;
+  }
+
+  // Builds a stable unique key for a transfer order referenced by a row.
+  function buildTransferOrderUniqueKey(row) {
+    if (row.transferOrderId) return 'id:' + row.transferOrderId;
+    if (row.transferOrderNumber) return 'tranid:' + normalizeMatchText(row.transferOrderNumber);
+
+    const orderKey = normalizeOrderReferenceKey(row.purchaseOrder || row.name || row.transactionType || '');
+    return orderKey && orderKey.indexOf('TO') === 0 ? 'ref:' + orderKey : '';
+  }
+
+  // Fetches and summarizes the immediately preceding period that has the same
+  // number of days as the selected range.
   function fetchPreviousPeriodSummary(filters, recordType) {
     const previousFilters = buildPreviousPeriodFilters(filters);
 
     try {
-      const previousRows = applyResultFilters(
-        buildViewRows(fetchRows(previousFilters, recordType)
-          .map(row => normalizeRow(row, recordType)), previousFilters.viewMode),
-        previousFilters
+      const previousBaseRows = buildViewRows(
+        fetchRows(previousFilters, recordType).map(row => normalizeRow(row, recordType)),
+        previousFilters.viewMode
       );
+      const previousFilteredBaseRows = applyResultFilters(previousBaseRows, withoutTransferOrderStatusFilter(previousFilters));
+      const previousRowsForFilters = previousFilters.toStatus && previousFilters.toStatus !== 'ALL' ?
+        enrichRowsWithTransferOrderInfo(previousFilteredBaseRows) :
+        previousFilteredBaseRows;
+      const previousRows = applyResultFilters(previousRowsForFilters, previousFilters);
 
       return {
         filters: previousFilters,
@@ -1089,6 +1460,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Computes the prior date range immediately before the current range.
   function buildPreviousPeriodFilters(filters) {
     const start = isoDateBoundary(filters.dateFrom, false);
     const end = isoDateBoundary(filters.dateTo, false);
@@ -1105,6 +1477,15 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     });
   }
 
+  // Removes TO status as a filter while preserving the rest of the filter object.
+  // This allows the script to load candidate rows before TO enrichment.
+  function withoutTransferOrderStatusFilter(filters) {
+    return Object.assign({}, filters, {
+      toStatus: 'ALL'
+    });
+  }
+
+  // Builds KPI comparison metadata consumed by buildKpiDeltaHtml().
   function buildSummaryComparison(currentSummary, previousSummary, previousFilters) {
     return {
       previousDateFrom: previousFilters.dateFrom,
@@ -1119,6 +1500,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Compares one current KPI value against its previous-period value.
   function buildComparisonValue(currentValue, previousValue, isPercent) {
     const current = Number(currentValue || 0);
     const previous = Number(previousValue || 0);
@@ -1131,6 +1513,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Default stats object used when search work did not run or failed before a
+  // stats-bearing row array was created.
   function buildEmptySearchStats() {
     return {
       scanned: 0,
@@ -1143,6 +1527,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Builds headline insight cards from the currently visible row set.
   function buildInsights(rows) {
     const failedRows = rows.filter(r => r.status === 'FAILED');
     const latestFailure = getLatestRow(failedRows);
@@ -1163,16 +1548,20 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Returns the newest row according to NetSuite created date and ID.
   function getLatestRow(rows) {
     return rows.slice().sort(compareRowsNewestFirst)[0] || null;
   }
 
+  // Returns the newest failed rows for optional dashboard sections.
   function buildLatestFailures(rows) {
     return rows.filter(r => r.status === 'FAILED')
       .sort(compareRowsNewestFirst)
       .slice(0, 5);
   }
 
+  // For current-view drilldown, keep only the latest row for each unique failure
+  // drilldown key so duplicates do not overwhelm the table.
   function buildLatestUniqueDrilldownRows(rows) {
     const map = {};
 
@@ -1190,16 +1579,86 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .sort(compareRowsNewestFirst);
   }
 
+  // Chooses the row shaping strategy for the selected dashboard mode.
   function buildViewRows(rows, viewMode) {
     if (viewMode === 'HISTORY') return buildHistoryRows(rows);
     return buildCurrentTransactionRows(rows);
   }
 
+  // Chooses the table row strategy for the selected dashboard mode.
   function buildViewDrilldownRows(rows, viewMode) {
     if (viewMode === 'HISTORY') return rows.slice().sort(compareRowsNewestFirst);
     return buildLatestUniqueDrilldownRows(rows);
   }
 
+  // Adds transfer order ID, number, status, key, and URL to rows when enough
+  // transfer-order references can be resolved.
+  function enrichRowsWithTransferOrderInfo(rows) {
+    const rowList = rows || [];
+    const lookupCandidates = collectTransferOrderLookupCandidates(rowList);
+
+    loadTransferOrderInfoBatch(lookupCandidates);
+
+    return rowList.map(row => {
+      const transferOrder = findCachedTransferOrderInfo(row);
+
+      if (!transferOrder.id) return row;
+
+      return Object.assign({}, row, {
+        transferOrderId: transferOrder.id,
+        transferOrderNumber: transferOrder.tranId,
+        transferOrderStatus: transferOrder.status,
+        transferOrderStatusKey: transferOrder.statusKey,
+        transferOrderUrl: transferOrder.url
+      });
+    });
+  }
+
+  // Builds batched lookup lists for transfer order IDs and tranids, skipping
+  // candidates that are already in the request-level cache.
+  function collectTransferOrderLookupCandidates(rows) {
+    const candidateMap = {};
+    const ids = [];
+    const tranIds = [];
+
+    (rows || []).forEach(row => {
+      buildTransferOrderLookupCandidates(row).forEach(candidate => {
+        if (!candidate || !candidate.key || candidateMap[candidate.key]) return;
+
+        candidateMap[candidate.key] = true;
+
+        if (Object.prototype.hasOwnProperty.call(transferOrderInfoCache, candidate.key)) return;
+
+        if (candidate.type === 'id') ids.push(candidate.value);
+        else if (candidate.type === 'tranid') tranIds.push(candidate.value);
+      });
+    });
+
+    return {
+      ids,
+      tranIds
+    };
+  }
+
+  // Finds cached transfer-order info for any candidate reference on a row.
+  function findCachedTransferOrderInfo(row) {
+    const candidates = buildTransferOrderLookupCandidates(row);
+
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+
+      if (Object.prototype.hasOwnProperty.call(transferOrderInfoCache, candidate.key)) {
+        const info = transferOrderInfoCache[candidate.key];
+
+        if (info && info.id) return info;
+      }
+    }
+
+    return buildEmptyTransferOrderInfo();
+  }
+
+  // History view keeps every response row, but marks failed rows as resolved when
+  // a newer success exists for the same transaction key.
   function buildHistoryRows(rows) {
     const latestSuccessByTransaction = {};
 
@@ -1228,6 +1687,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }).sort(compareRowsNewestFirst);
   }
 
+  // Current view collapses all response rows to the latest row per transaction.
   function buildCurrentTransactionRows(rows) {
     const map = {};
 
@@ -1245,6 +1705,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .sort(compareRowsNewestFirst);
   }
 
+  // Builds the best available key for grouping response rows by transaction.
   function buildCurrentTransactionKey(row) {
     const candidates = [
       row.purchaseOrder,
@@ -1262,16 +1723,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return normalizeMatchText(row.purchaseOrder || row.name || row.sanminaOrderNumber || row.transactionType || row.id);
   }
 
+  // Extracts a canonical order reference, such as TO12345, from a free-text value.
   function normalizeOrderReferenceKey(value) {
-    const text = String(value || '');
-    const match = text.match(/\b((?:to|po|so|wo)\s*#?\s*\d+)\b/i) ||
-      text.match(/#\s*((?:to|po|so|wo)\s*\d+)/i);
-
-    if (!match) return '';
-
-    return match[1].replace(/[^a-z0-9]/gi, '').toUpperCase();
+    const reference = parseTransactionReference(value);
+    return reference ? reference.tranId : '';
   }
 
+  // Builds the key used to deduplicate current-view drilldown rows while keeping
+  // distinct categories/messages separate.
   function buildDrilldownUniqueKey(row) {
     const transactionKey = row.purchaseOrder ||
       row.sanminaOrderNumber ||
@@ -1290,6 +1749,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     ].join('|');
   }
 
+  // Normalizes message text for drilldown grouping while preserving enough detail
+  // to keep materially different failures separate.
   function normalizeDrilldownMessage(value) {
     return normalizeMatchText(value)
       .replace(/\b(internal\s+id|record\s+id)\s*#?\s*\d+\b/g, '$1 #')
@@ -1297,6 +1758,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .replace(/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g, 'date');
   }
 
+  // Sort comparator for newest-first display, using internal ID as a tie-breaker.
   function compareRowsNewestFirst(a, b) {
     const aDate = parseNsDateTime(a.created);
     const bDate = parseNsDateTime(b.created);
@@ -1305,6 +1767,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return bTime - aTime || Number(b.id || 0) - Number(a.id || 0);
   }
 
+  // Generic helper for top-N style insight cards.
   function getTopGroupedValue(rows, keyFn) {
     const map = {};
 
@@ -1320,6 +1783,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return top || { name: 'None', count: 0 };
   }
 
+  // Builds a link to the configured retry Suitelet. It expects an order internal
+  // ID, so callers resolve transaction numbers before reaching this helper.
   function buildOrderRetryUrl(orderId) {
     const cleanOrderId = normalizeInternalId(orderId);
     const retrySuitelet = CONFIG.retrySuitelet || {};
@@ -1334,6 +1799,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     ];
 
     if (companyId) {
+      // compid is included for external-style Suitelet URLs when the target
+      // account requires it.
       params.push('compid=' + encodeURIComponent(companyId));
     }
 
@@ -1342,6 +1809,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '/app/site/hosting/scriptlet.nl?' + params.join('&');
   }
 
+  // Returns the retry Suitelet account/company id override, falling back to the
+  // current runtime account.
   function getRetryCompanyId(retrySuitelet) {
     if (retrySuitelet && retrySuitelet.companyId) {
       return String(retrySuitelet.companyId);
@@ -1354,11 +1823,14 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Validates that a value is a plain NetSuite internal ID.
   function normalizeInternalId(value) {
     const text = String(value || '').trim();
     return /^\d+$/.test(text) ? text : '';
   }
 
+  // Finds the transaction internal ID used by retry actions. Direct custom-field
+  // IDs are preferred; otherwise free-text transaction references are searched.
   function resolveRetryOrderInternalId(row) {
     const directId = normalizeInternalId(row.purchase_order_id || row.purchase_order);
 
@@ -1380,6 +1852,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Resolves a transaction reference such as TO12345 into a NetSuite internal ID,
+  // with per-request caching for repeated references.
   function findTransactionInternalId(value) {
     const reference = parseTransactionReference(value);
 
@@ -1394,6 +1868,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     const searchTypes = getTransactionSearchTypes(reference.prefix);
     let internalId = '';
 
+    // Try the specific transaction type first, then fall back to a broad
+    // transaction search when needed.
     for (let i = 0; i < searchTypes.length; i++) {
       internalId = findTransactionInternalIdBySearchType(searchTypes[i], reference.tranId);
 
@@ -1404,14 +1880,16 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return internalId;
   }
 
+  // Extracts a transaction reference from free text. Handles values like
+  // "Transfer Order #TO123", "TO123", or "T00123" from integration messages.
   function parseTransactionReference(value) {
     const text = String(value || '');
-    const match = text.match(/#\s*((?:to|po|so|wo)\s*#?\s*\d+)/i) ||
-      text.match(/\b((?:to|po|so|wo)\s*#?\s*\d+)\b/i);
+    const match = text.match(/#\s*((?:(?:to|po|so|wo)|t)\s*#?\s*\d+)/i) ||
+      text.match(/\b((?:(?:to|po|so|wo)|t)\s*#?\s*\d+)\b/i);
 
     if (!match) return null;
 
-    const tranId = match[1].replace(/[^a-z0-9]/gi, '').toUpperCase();
+    const tranId = normalizeTransactionReferenceId(match[1]);
     const prefix = tranId.substring(0, 2);
 
     if (!/^(TO|PO|SO|WO)\d+$/i.test(tranId)) return null;
@@ -1422,6 +1900,28 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Canonicalizes a transaction reference by removing punctuation and expanding
+  // short transfer-order values that appear as T123 into TO123.
+  function normalizeTransactionReferenceId(value) {
+    const raw = String(value || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+    const transferOrderMatch = raw.match(/^T(\d+)$/);
+
+    if (transferOrderMatch && raw.indexOf('TO') !== 0) {
+      let digits = transferOrderMatch[1];
+
+      // Some integrations send transfer order numbers with an extra leading zero.
+      if (digits.length > 5 && digits.charAt(0) === '0') {
+        digits = digits.substring(1);
+      }
+
+      return 'TO' + digits;
+    }
+
+    return raw;
+  }
+
+  // Returns the best NetSuite search types for the transaction prefix. The broad
+  // transaction type is kept as a fallback for account/version differences.
   function getTransactionSearchTypes(prefix) {
     const transactionSearchType = getSearchTypeValue('TRANSACTION', 'transaction');
     const typesByPrefix = {
@@ -1437,6 +1937,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       [transactionSearchType];
   }
 
+  // Safely reads search.Type enum values while preserving fallback strings for
+  // older or unusual NetSuite runtime contexts.
   function getSearchTypeValue(enumName, fallback) {
     try {
       return search.Type && search.Type[enumName] ? search.Type[enumName] : fallback;
@@ -1445,6 +1947,9 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Looks up a transaction internal ID by tranid. It tries with mainline first
+  // and without mainline second because not every search type supports the same
+  // filters.
   function findTransactionInternalIdBySearchType(searchType, tranId) {
     const attempts = [true, false];
 
@@ -1457,6 +1962,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Executes one transaction lookup attempt for a given search type and mainline
+  // filter setting.
   function runTransactionInternalIdLookup(searchType, tranId, useMainlineFilter) {
     const colInternalId = search.createColumn({ name: 'internalid' });
     const filters = [['tranid', 'is', tranId]];
@@ -1488,6 +1995,639 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Kept as a small wrapper so older call sites can resolve TO info through one
+  // function even though the current implementation is cache-backed.
+  function resolveTransferOrderInfo(row) {
+    return findCachedTransferOrderInfo(row);
+  }
+
+  // Builds every plausible transfer-order lookup candidate from a response row:
+  // direct internal ID and any TO tranid embedded in key text fields.
+  function buildTransferOrderLookupCandidates(row) {
+    const candidates = [];
+    const directId = normalizeInternalId(row.purchase_order_id || row.purchaseOrderId || row.purchase_order || row.purchaseOrder);
+
+    // A direct numeric purchase_order value may already be a TO internal ID.
+    addTransferOrderLookupCandidate(candidates, 'id', directId);
+
+    [
+      row.purchase_order || row.purchaseOrder,
+      row.name,
+      row.transaction_type || row.transactionType,
+      row.sanmina_order_number || row.sanminaOrderNumber
+    ].forEach(value => {
+      const reference = parseTransactionReference(value);
+
+      if (reference && reference.prefix === 'TO') {
+        // Only transfer-order references are used for TO status enrichment.
+        addTransferOrderLookupCandidate(candidates, 'tranid', reference.tranId);
+      }
+    });
+
+    return candidates;
+  }
+
+  // Loads transfer-order header/status information in batches, using search as
+  // the preferred path and SuiteQL as a fallback.
+  function loadTransferOrderInfoBatch(candidates) {
+    const ids = uniqueArray((candidates && candidates.ids) || []).map(normalizeInternalId).filter(Boolean);
+    const tranIds = uniqueArray((candidates && candidates.tranIds) || [])
+      .map(normalizeTransactionReferenceId)
+      .filter(isTransferOrderTranId);
+
+    if (!ids.length && !tranIds.length) return;
+
+    if (!hasTransferOrderLookupUsage()) {
+      // TO status is optional; skip it instead of risking a governance failure
+      // that would prevent the rest of the dashboard from loading.
+      log.error({
+        title: 'Transfer order status lookup skipped',
+        details: 'Remaining usage was too low to load TO status tiles safely.'
+      });
+      return;
+    }
+
+    const batchSize = Math.max(25, Math.min(800, Number(CONFIG.transferOrderLookupBatchSize || 400)));
+    const maxLength = Math.max(ids.length, tranIds.length);
+
+    for (let i = 0; i < maxLength; i += batchSize) {
+      if (!hasTransferOrderLookupUsage()) return;
+
+      const batchIds = ids.slice(i, i + batchSize);
+      const batchTranIds = tranIds.slice(i, i + batchSize);
+
+      if (!batchIds.length && !batchTranIds.length) continue;
+
+      // Prefer N/search because it produces display text reliably; fall back to
+      // SuiteQL when search fails in an account-specific way.
+      if (!runTransferOrderSearchLookup(batchIds, batchTranIds)) {
+        runTransferOrderSuiteQlLookup(batchIds, batchTranIds);
+      }
+
+      // Header status can miss partially fulfilled nuance in some accounts, so
+      // line-level status overrides are applied when governance allows.
+      applyTransferOrderLineStatusOverrides(batchIds, batchTranIds);
+    }
+  }
+
+  // SuiteQL fallback for transfer-order status lookup.
+  function runTransferOrderSuiteQlLookup(ids, tranIds) {
+    const whereClause = buildTransferOrderSuiteQlWhere(ids, tranIds);
+
+    if (!whereClause) return true;
+
+    const queries = [
+      'SELECT id, tranid, status, BUILTIN.DF(status) AS status_text FROM transaction WHERE type = ' + suiteQlString('TrnfrOrd') + ' AND (' + whereClause + ')',
+      'SELECT id, tranid, status FROM transaction WHERE type = ' + suiteQlString('TrnfrOrd') + ' AND (' + whereClause + ')'
+    ];
+
+    for (let i = 0; i < queries.length; i++) {
+      try {
+        processTransferOrderMappedRows(query.runSuiteQL({
+          query: queries[i]
+        }).asMappedResults());
+
+        return true;
+      } catch (e) {
+        if (i === queries.length - 1) {
+          log.error({
+            title: 'Transfer order status batch SuiteQL lookup failed',
+            details: e
+          });
+        }
+      }
+    }
+
+    return false;
+  }
+
+  // Builds the WHERE clause for the SuiteQL TO lookup using only sanitized IDs
+  // and escaped string literals.
+  function buildTransferOrderSuiteQlWhere(ids, tranIds) {
+    const clauses = [];
+    const cleanIds = uniqueArray(ids || []).map(normalizeInternalId).filter(Boolean);
+    const cleanTranIds = uniqueArray(tranIds || [])
+      .map(normalizeTransactionReferenceId)
+      .filter(isTransferOrderTranId);
+
+    if (cleanIds.length) {
+      clauses.push('id IN (' + cleanIds.join(',') + ')');
+    }
+
+    if (cleanTranIds.length) {
+      clauses.push('tranid IN (' + cleanTranIds.map(suiteQlString).join(',') + ')');
+    }
+
+    return clauses.join(' OR ');
+  }
+
+  // Converts SuiteQL mapped rows into cached transfer-order info records.
+  function processTransferOrderMappedRows(rows) {
+    (rows || []).forEach(row => {
+      const info = buildTransferOrderInfoFromMappedRow(row);
+
+      if (info.id || info.tranId) {
+        if (info.id) cacheTransferOrderInfo('id:' + info.id, info);
+        if (info.tranId) cacheTransferOrderInfo('tranid:' + info.tranId, info);
+      }
+    });
+  }
+
+  // Normalizes one SuiteQL transfer-order row.
+  function buildTransferOrderInfoFromMappedRow(row) {
+    const id = normalizeInternalId(getMappedValue(row, 'id'));
+    const tranId = cleanNetSuiteText(getMappedValue(row, 'tranid')).toUpperCase();
+    const rawStatus = cleanNetSuiteText(getMappedValue(row, 'status_text')) ||
+      cleanNetSuiteText(getMappedValue(row, 'status'));
+    const statusKey = normalizeTransferOrderStatusKey(rawStatus);
+
+    return {
+      id,
+      tranId,
+      status: formatTransferOrderStatusLabel(statusKey, rawStatus),
+      statusKey,
+      url: ''
+    };
+  }
+
+  // Preferred transfer-order lookup path using N/search.
+  function runTransferOrderSearchLookup(ids, tranIds) {
+    const filterExpression = buildTransferOrderSearchFilterExpression(ids, tranIds);
+
+    if (!filterExpression) return true;
+
+    const colInternalId = search.createColumn({ name: 'internalid' });
+    const colTranId = search.createColumn({ name: 'tranid' });
+    const colStatus = search.createColumn({ name: 'status' });
+    const colStatusRef = search.createColumn({ name: 'statusref' });
+
+    try {
+      search.create({
+        type: getSearchTypeValue('TRANSFER_ORDER', 'transferorder'),
+        filters: [filterExpression, 'AND', ['mainline', 'is', 'T']],
+        columns: [colInternalId, colTranId, colStatusRef, colStatus]
+      }).run().each(result => {
+        const info = buildTransferOrderInfoFromSearchResult(result, {
+          colInternalId,
+          colTranId,
+          colStatusRef,
+          colStatus
+        });
+
+        // Cache under both possible lookup keys so later rows can reuse the info.
+        if (info.id || info.tranId) {
+          if (info.id) cacheTransferOrderInfo('id:' + info.id, info);
+          if (info.tranId) cacheTransferOrderInfo('tranid:' + info.tranId, info);
+        }
+
+        return hasTransferOrderLookupUsage();
+      });
+
+      return true;
+    } catch (e) {
+      log.error({
+        title: 'Transfer order status batch search lookup failed',
+        details: e
+      });
+    }
+
+    return false;
+  }
+
+  // Attempts to refine TO statuses from line data. This is especially helpful for
+  // partial fulfillment, which may not be obvious from every header status value.
+  function applyTransferOrderLineStatusOverrides(ids, tranIds) {
+    const filterExpression = buildTransferOrderSearchFilterExpression(ids, tranIds);
+
+    if (!filterExpression || !hasTransferOrderLookupUsage()) return false;
+
+    const closedFieldIds = ['closed', 'isclosed'];
+    const fulfilledFieldIds = ['quantityfulfilled', 'quantityshiprecv'];
+
+    for (let i = 0; i < closedFieldIds.length; i++) {
+      let closedFieldWorked = false;
+
+      // Try every known fulfilled-quantity field with each known closed flag.
+      for (let j = 0; j < fulfilledFieldIds.length; j++) {
+        if (!hasTransferOrderLookupUsage()) return closedFieldWorked;
+
+        const result = runTransferOrderLineStatusOverrideSearch(
+          filterExpression,
+          closedFieldIds[i],
+          fulfilledFieldIds[j]
+        );
+
+        if (result.success) {
+          closedFieldWorked = true;
+
+          if (result.hasFulfillmentData) return true;
+        }
+      }
+
+      if (closedFieldWorked) return true;
+    }
+
+    // Final fallback: closed-line detection only. It cannot identify partial
+    // fulfillment but can still identify fully closed orders.
+    for (let i = 0; i < closedFieldIds.length; i++) {
+      if (!hasTransferOrderLookupUsage()) return false;
+
+      const result = runTransferOrderLineStatusOverrideSearch(filterExpression, closedFieldIds[i], '');
+
+      if (result.success) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Reads transfer-order item lines to infer closed and partially fulfilled state
+  // from line quantities and closed flags.
+  function runTransferOrderLineStatusOverrideSearch(filterExpression, closedFieldId, fulfilledFieldId) {
+    const lineStateByOrder = {};
+    const hasFulfillmentColumn = !!fulfilledFieldId;
+
+    try {
+      const colInternalId = search.createColumn({ name: 'internalid' });
+      const colTranId = search.createColumn({ name: 'tranid' });
+      const colQuantity = search.createColumn({ name: 'quantity' });
+      const colClosed = search.createColumn({ name: closedFieldId });
+      const colFulfilled = hasFulfillmentColumn ? search.createColumn({ name: fulfilledFieldId }) : null;
+      const columns = [colInternalId, colTranId, colQuantity, colClosed];
+
+      if (colFulfilled) {
+        columns.push(colFulfilled);
+      }
+
+      search.create({
+        type: getSearchTypeValue('TRANSFER_ORDER', 'transferorder'),
+        filters: [
+          filterExpression,
+          'AND',
+          ['mainline', 'is', 'F'],
+          'AND',
+          ['item', 'noneof', '@NONE@']
+        ],
+        columns
+      }).run().each(result => {
+        const id = normalizeInternalId(safeSearchColumnValue(result, colInternalId));
+        const tranId = normalizeTransactionReferenceId(safeSearchColumnValue(result, colTranId));
+        const key = id ? 'id:' + id : tranId ? 'tranid:' + tranId : '';
+
+        if (!key) return hasTransferOrderLookupUsage();
+
+        // Track cumulative line state per transfer order.
+        if (!lineStateByOrder[key]) {
+          lineStateByOrder[key] = {
+            id,
+            tranId,
+            lineCount: 0,
+            closedCount: 0,
+            totalQuantity: 0,
+            fulfilledQuantity: 0,
+            fulfilledLineCount: 0
+          };
+        }
+
+        const quantity = Math.abs(parseNetSuiteNumber(safeSearchColumnValue(result, colQuantity)));
+        const fulfilledQuantity = colFulfilled ?
+          Math.abs(parseNetSuiteNumber(safeSearchColumnValue(result, colFulfilled))) :
+          0;
+
+        // Quantities are accumulated by absolute value because transfer order
+        // lines can appear signed differently depending on context.
+        lineStateByOrder[key].lineCount += 1;
+        lineStateByOrder[key].totalQuantity += quantity;
+
+        if (isNetSuiteTrue(safeSearchColumnValue(result, colClosed))) {
+          lineStateByOrder[key].closedCount += 1;
+        }
+
+        if (fulfilledQuantity > 0) {
+          lineStateByOrder[key].fulfilledQuantity += fulfilledQuantity;
+          lineStateByOrder[key].fulfilledLineCount += 1;
+        }
+
+        return hasTransferOrderLookupUsage();
+      });
+
+      applyTransferOrderLineStatusState(lineStateByOrder, hasFulfillmentColumn);
+      return {
+        success: true,
+        hasFulfillmentData: hasFulfillmentColumn && Object.keys(lineStateByOrder).some(key => {
+          // Signal to the caller that the fulfilled column was meaningful in this
+          // account/search context.
+          return lineStateByOrder[key].fulfilledQuantity > 0;
+        })
+      };
+    } catch (e) {
+      return {
+        success: false,
+        hasFulfillmentData: false
+      };
+    }
+  }
+
+  // Applies inferred line-state status back into the transfer-order cache.
+  function applyTransferOrderLineStatusState(lineStateByOrder, hasFulfillmentColumn) {
+    Object.keys(lineStateByOrder || {}).forEach(key => {
+      const state = lineStateByOrder[key];
+      const existing = transferOrderInfoCache[key] || transferOrderInfoCache['id:' + state.id] || transferOrderInfoCache['tranid:' + state.tranId] || buildEmptyTransferOrderInfo();
+      let statusKey = '';
+
+      if (!state.lineCount) return;
+
+      // All closed lines means the order should be displayed as Closed even when
+      // the header status text varies.
+      if (state.closedCount === state.lineCount) {
+        statusKey = 'CLOSED';
+      } else if (hasFulfillmentColumn && existing.statusKey !== 'CLOSED' && isPartiallyFulfilledLineState(state)) {
+        statusKey = 'PARTIALLY_FULFILLED';
+      }
+
+      if (!statusKey) return;
+
+      const statusInfo = Object.assign({}, existing, {
+        id: existing.id || state.id,
+        tranId: existing.tranId || state.tranId,
+        status: TRANSFER_ORDER_STATUS_LABELS[statusKey],
+        statusKey
+      });
+
+      // Store under both keys so id-based and tranid-based dashboard rows agree.
+      if (statusInfo.id) cacheTransferOrderInfo('id:' + statusInfo.id, statusInfo);
+      if (statusInfo.tranId) cacheTransferOrderInfo('tranid:' + statusInfo.tranId, statusInfo);
+    });
+  }
+
+  // Determines whether accumulated line quantities indicate partial fulfillment.
+  function isPartiallyFulfilledLineState(state) {
+    if (!state || state.fulfilledQuantity <= 0) return false;
+
+    if (state.totalQuantity <= 0) return true;
+
+    return state.fulfilledQuantity < state.totalQuantity || state.closedCount < state.lineCount;
+  }
+
+  // Builds an OR filter expression for TO searches from internal IDs and tranids.
+  function buildTransferOrderSearchFilterExpression(ids, tranIds) {
+    const terms = [];
+    const cleanIds = uniqueArray(ids || []).map(normalizeInternalId).filter(Boolean);
+    const cleanTranIds = uniqueArray(tranIds || [])
+      .map(normalizeTransactionReferenceId)
+      .filter(isTransferOrderTranId);
+
+    if (cleanIds.length) {
+      terms.push(['internalid', 'anyof', cleanIds]);
+    }
+
+    cleanTranIds.forEach(tranId => {
+      terms.push(['tranid', 'is', tranId]);
+    });
+
+    if (!terms.length) return null;
+
+    return terms.reduce((expression, term) => {
+      return expression ? [expression, 'OR', term] : term;
+    }, null);
+  }
+
+  // Adds a lookup candidate while deduplicating by type/value.
+  function addTransferOrderLookupCandidate(candidates, type, value) {
+    const cleanValue = String(value || '').trim();
+    if (!type || !cleanValue) return;
+
+    const key = type + ':' + cleanValue;
+    if (candidates.some(candidate => candidate.key === key)) return;
+
+    candidates.push({
+      key,
+      type,
+      value: cleanValue
+    });
+  }
+
+  // Stores a transfer-order info object under the supplied key and any canonical
+  // id/tranid keys available inside the info object.
+  function cacheTransferOrderInfo(key, info) {
+    const safeInfo = info || buildEmptyTransferOrderInfo();
+
+    transferOrderInfoCache[key] = safeInfo;
+
+    if (safeInfo.id) {
+      transferOrderInfoCache['id:' + safeInfo.id] = safeInfo;
+    }
+
+    if (safeInfo.tranId) {
+      transferOrderInfoCache['tranid:' + safeInfo.tranId] = safeInfo;
+    }
+  }
+
+  // Normalizes one N/search transfer-order result.
+  function buildTransferOrderInfoFromSearchResult(result, columns) {
+    const id = normalizeInternalId(safeSearchColumnValue(result, columns.colInternalId));
+    const tranId = cleanNetSuiteText(safeSearchColumnValue(result, columns.colTranId)).toUpperCase();
+    const rawStatus = cleanNetSuiteText(safeSearchColumnValue(result, columns.colStatusRef)) ||
+      cleanNetSuiteText(safeSearchColumnText(result, columns.colStatusRef)) ||
+      cleanNetSuiteText(safeSearchColumnText(result, columns.colStatus)) ||
+      cleanNetSuiteText(safeSearchColumnValue(result, columns.colStatus));
+    const statusKey = normalizeTransferOrderStatusKey(rawStatus);
+
+    return {
+      id,
+      tranId,
+      status: formatTransferOrderStatusLabel(statusKey, rawStatus),
+      statusKey,
+      url: ''
+    };
+  }
+
+  // Safely reads a search column value as text.
+  function safeSearchColumnValue(result, column) {
+    try {
+      const value = result.getValue(column);
+
+      if (value !== null && value !== undefined && value !== '') {
+        return String(value);
+      }
+    } catch (e) {
+      // Ignore and let the caller try another value source.
+    }
+
+    return '';
+  }
+
+  // Safely reads a search column display text.
+  function safeSearchColumnText(result, column) {
+    try {
+      const text = result.getText(column);
+
+      if (text !== null && text !== undefined && text !== '') {
+        return String(text);
+      }
+    } catch (e) {
+      // Some search columns do not expose text values.
+    }
+
+    return '';
+  }
+
+  // Empty transfer-order info object used when enrichment cannot resolve a row.
+  function buildEmptyTransferOrderInfo() {
+    return {
+      id: '',
+      tranId: '',
+      status: '',
+      statusKey: '',
+      url: ''
+    };
+  }
+
+  // Builds a link to the transfer-order record when an internal ID is available.
+  function buildTransferOrderUrl(id) {
+    if (!id) return '';
+
+    try {
+      return url.resolveRecord({
+        recordType: getSearchTypeValue('TRANSFER_ORDER', 'transferorder'),
+        recordId: id,
+        isEditMode: false
+      }) || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  // Deduplicates and trims an array of values while preserving first-seen order.
+  function uniqueArray(values) {
+    const seen = {};
+    const result = [];
+
+    (values || []).forEach(value => {
+      const cleanValue = String(value || '').trim();
+      if (!cleanValue || seen[cleanValue]) return;
+
+      seen[cleanValue] = true;
+      result.push(cleanValue);
+    });
+
+    return result;
+  }
+
+  // Checks whether a value normalizes to a transfer-order transaction number.
+  function isTransferOrderTranId(value) {
+    return /^TO\d+$/i.test(normalizeTransactionReferenceId(value));
+  }
+
+  // Escapes a JavaScript value as a quoted SuiteQL string literal.
+  function suiteQlString(value) {
+    return "'" + String(value || '').replace(/'/g, "''") + "'";
+  }
+
+  // Reads a SuiteQL mapped-result value regardless of key casing.
+  function getMappedValue(row, key) {
+    if (!row || !key) return '';
+
+    if (Object.prototype.hasOwnProperty.call(row, key)) return row[key];
+
+    const upperKey = String(key).toUpperCase();
+    if (Object.prototype.hasOwnProperty.call(row, upperKey)) return row[upperKey];
+
+    const lowerKey = String(key).toLowerCase();
+    const rowKeys = Object.keys(row);
+
+    for (let i = 0; i < rowKeys.length; i++) {
+      if (String(rowKeys[i]).toLowerCase() === lowerKey) {
+        return row[rowKeys[i]];
+      }
+    }
+
+    return '';
+  }
+
+  // Cleans NetSuite adapter/null display values that sometimes appear when
+  // SuiteQL/search returns an empty field-like object.
+  function cleanNetSuiteText(value) {
+    if (value === null || value === undefined) return '';
+
+    const text = String(value).trim();
+
+    if (!text || text.indexOf('ScriptNullObjectAdapter@') >= 0) return '';
+
+    return text;
+  }
+
+  // Normalizes NetSuite checkbox/boolean-ish values.
+  function isNetSuiteTrue(value) {
+    const text = String(value || '').trim().toUpperCase();
+    return value === true || text === 'T' || text === 'TRUE' || text === 'YES' || text === 'Y' || text === '1';
+  }
+
+  // Parses NetSuite numeric strings, including comma-formatted quantities.
+  function parseNetSuiteNumber(value) {
+    const numberValue = Number(String(value || '').replace(/,/g, '').trim());
+    return isNaN(numberValue) ? 0 : numberValue;
+  }
+
+  // Governance guard for optional transfer-order enrichment work.
+  function hasTransferOrderLookupUsage() {
+    return getRemainingUsage() > Number(CONFIG.transferOrderLookupMinUsage || 250);
+  }
+
+  // Safely reads remaining governance units. Non-NetSuite parser/test contexts
+  // get a high fake value so helper logic can still run.
+  function getRemainingUsage() {
+    try {
+      return runtime.getCurrentScript().getRemainingUsage();
+    } catch (e) {
+      return 10000;
+    }
+  }
+
+  // Converts raw NetSuite transfer-order status values/codes into canonical keys.
+  function normalizeTransferOrderStatusKey(value) {
+    const raw = String(value || '').trim();
+    const text = normalizeMatchText(raw);
+    const compact = text.replace(/[^a-z0-9]/g, '');
+    const codeMatch = raw.match(/TrnfrOrd:([A-Z])/i);
+    const statusCode = codeMatch ? codeMatch[1].toUpperCase() : (/^[A-Z]$/i.test(raw) ? raw.toUpperCase() : '');
+
+    if (compact.indexOf('pendingfulfillment') >= 0 || statusCode === 'B') {
+      return 'PENDING_FULFILLMENT';
+    }
+
+    if (
+      compact.indexOf('partiallyfulfilled') >= 0 ||
+      compact.indexOf('partfulfilled') >= 0 ||
+      compact.indexOf('partiallyfulfill') >= 0 ||
+      statusCode === 'D' ||
+      statusCode === 'E'
+    ) {
+      return 'PARTIALLY_FULFILLED';
+    }
+
+    if (compact.indexOf('closed') >= 0 || statusCode === 'G' || statusCode === 'H') {
+      return 'CLOSED';
+    }
+
+    return '';
+  }
+
+  // Whitelist for TO statuses that the dashboard explicitly tracks.
+  function isTrackedTransferOrderStatusKey(statusKey) {
+    return statusKey === 'PENDING_FULFILLMENT' ||
+      statusKey === 'PARTIALLY_FULFILLED' ||
+      statusKey === 'CLOSED';
+  }
+
+  // Returns the friendly status label when a canonical key is known; otherwise
+  // preserves the raw status text.
+  function formatTransferOrderStatusLabel(statusKey, rawStatus) {
+    return TRANSFER_ORDER_STATUS_LABELS[statusKey] || String(rawStatus || '').trim();
+  }
+
+  // Counts failures on or after a supplied Date.
   function countFailuresSince(rows, sinceDate) {
     return rows.filter(r => {
       const createdDate = parseNsDateTime(r.created);
@@ -1495,6 +2635,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }).length;
   }
 
+  // Builds the failure fingerprint table data used for root-cause style summaries.
   function buildFailureFingerprints(rows) {
     const map = {};
 
@@ -1525,6 +2666,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .slice(0, 8);
   }
 
+  // Numeric severity rank used for sorting failure fingerprints and table rows.
   function getSeverityRank(severity) {
     const ranks = {
       Critical: 4,
@@ -1537,6 +2679,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return ranks[severity] || 0;
   }
 
+  // Counts failed rows by inferred category.
   function buildCategoryBreakdown(rows) {
     const map = {};
     rows.filter(r => r.status === 'FAILED').forEach(r => {
@@ -1548,6 +2691,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
   }
 
+  // Builds daily or weekly trend buckets depending on date range length.
   function buildDailyTrend(rows, filters) {
     const map = {};
     const start = isoDateBoundary(filters.dateFrom, false);
@@ -1555,11 +2699,13 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     const useWeeklyBuckets = getDateRangeDays(start, end) > 31;
 
     if (useWeeklyBuckets) {
+      // Wide ranges are grouped weekly to keep the SVG readable.
       for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 7)) {
         const bucket = buildTrendBucket(d, start, end);
         map[bucket.date] = bucket;
       }
     } else {
+      // Short ranges get one bucket per day, including days with zero records.
       for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
         const key = toIsoDate(d);
         map[key] = {
@@ -1580,6 +2726,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       const key = useWeeklyBuckets && createdDate ? getWeeklyTrendKey(createdDate, start) : (r.createdKey || getCreatedDateKey(r.created));
 
       if (!map[key]) {
+        // Keep rows with odd created dates visible by creating a bucket on demand.
         map[key] = useWeeklyBuckets && createdDate ?
           buildTrendBucket(createdDate, start, end) :
           { date: key, dateFrom: key, dateTo: key, label: key.substring(5), title: key, success: 0, failed: 0, unknown: 0 };
@@ -1593,6 +2740,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return Object.values(map).sort((a, b) => a.date.localeCompare(b.date));
   }
 
+  // Builds one weekly trend bucket from a date inside the selected range.
   function buildTrendBucket(dateObj, rangeStart, rangeEnd) {
     const bucketIndex = getWeeklyTrendIndex(dateObj, rangeStart);
     const bucketStart = new Date(rangeStart);
@@ -1619,17 +2767,20 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     };
   }
 
+  // Returns the ISO date key for the week bucket that contains dateObj.
   function getWeeklyTrendKey(dateObj, rangeStart) {
     const bucketStart = new Date(rangeStart);
     bucketStart.setDate(rangeStart.getDate() + (getWeeklyTrendIndex(dateObj, rangeStart) * 7));
     return toIsoDate(bucketStart);
   }
 
+  // Calculates a zero-based week bucket index relative to the selected range.
   function getWeeklyTrendIndex(dateObj, rangeStart) {
     const dayMs = 24 * 60 * 60 * 1000;
     return Math.max(0, Math.floor((stripTime(dateObj).getTime() - stripTime(rangeStart).getTime()) / (dayMs * 7)));
   }
 
+  // Builds the "Top PO / TO Activity" data set.
   function buildTopVendors(rows) {
     const map = {};
     rows.forEach(r => {
@@ -1647,6 +2798,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       .slice(0, 8);
   }
 
+  // Server-side retry action. The handler marks a response record using the
+  // configured retry fields and returns a JSON status object.
   function handleRetry(id, recordType) {
     if (!id) return { ok: false, message: 'Missing record id.' };
 
@@ -1676,6 +2829,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       const fieldCount = Object.keys(values).length;
 
       if (!fieldCount) {
+        // If no compatible field exists, fail gracefully with configuration
+        // guidance rather than writing nothing and reporting success.
         return {
           ok: false,
           message: 'No retry trigger field was found on ' + retryRecordType + '. Add one of the configured retry checkbox/status fields, or wire handleRetry() to the integration processor.'
@@ -1709,6 +2864,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Chooses a safe custom record type for retry writes.
   function getRetryRecordType(recordType) {
     const candidate = String(recordType || '').trim().toLowerCase();
 
@@ -1719,6 +2875,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return getConfiguredRecordTypeInfo({}).recordType || CONFIG.recordType || '';
   }
 
+  // Builds the submitFields payload for retry requests, choosing only fields that
+  // exist on the loaded record and match the intended type.
   function buildRetrySubmitValues(responseRecord, id) {
     const values = {};
     const requestedAt = new Date();
@@ -1729,6 +2887,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     const noteField = findCompatibleRecordField(responseRecord, retryConfig.noteFields, isTextLikeFieldType);
 
     if (!flagField && !statusField) {
+      // A retry request needs at least a flag or a status field to communicate
+      // intent to downstream processing.
       return values;
     }
 
@@ -1746,6 +2906,8 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return values;
   }
 
+  // Finds the first configured field that exists on the record and satisfies the
+  // supplied type predicate.
   function findCompatibleRecordField(responseRecord, fieldIds, typePredicate) {
     const ids = normalizeFieldIdList(fieldIds);
 
@@ -1761,6 +2923,7 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     return '';
   }
 
+  // Reads field type metadata from a loaded record.
   function getRecordFieldType(responseRecord, fieldId) {
     try {
       const field = responseRecord.getField({ fieldId });
@@ -1771,15 +2934,18 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
     }
   }
 
+  // Field type predicate for retry checkbox flags.
   function isCheckboxFieldType(fieldType) {
     return String(fieldType || '').toLowerCase() === 'checkbox';
   }
 
+  // Field type predicate for retry date/timestamp values.
   function isDateLikeFieldType(fieldType) {
     const type = String(fieldType || '').toLowerCase();
     return type === 'date' || type === 'datetime' || type === 'datetimetz';
   }
 
+  // Field type predicate for retry status/note strings.
   function isTextLikeFieldType(fieldType) {
     const type = String(fieldType || '').toLowerCase();
     return type === 'text' ||
@@ -1790,12 +2956,17 @@ define(['N/ui/serverWidget', 'N/query', 'N/search', 'N/record', 'N/runtime', 'N/
       type === 'inlinehtml';
   }
 
+  // Builds the full dashboard HTML: CSS, filters, charts, drilldown table, modal,
+  // and the embedded client-side script.
   function buildHtml(suiteletUrl, data) {
     const filters = data.filters || getDefaultDateRange();
     const rows = data.rows || [];
     const drilldownRows = data.drilldownRows || rows;
     const viewModeLabel = getViewModeLabel(filters.viewMode);
+    const toStatusLoaded = !!(data.summary && data.summary.toStatusLoaded);
 
+    // All dynamic data is escaped by helper functions before entering the HTML
+    // template. The returned string is assigned directly to INLINEHTML.
     return `
 ${buildCss()}
 <div class="dash">
@@ -1808,6 +2979,7 @@ ${buildCss()}
       <div id="lastRefreshed" class="dash-refresh" data-generated-at="${escAttr(data.generatedAt || '')}">${esc(formatLastRefreshedText(data.generatedAt))}</div>
       <div class="dash-actions">
         <button type="button" class="btn btn-primary" onclick="applyFilters(true)">Refresh</button>
+        ${toStatusLoaded ? '' : '<button type="button" class="btn" onclick="loadTransferOrderStatus()">Load TO Status</button>'}
         <button type="button" class="btn" onclick="resetDefaultRange()">Default Range</button>
         <button type="button" id="autoRefreshToggle" class="btn" onclick="toggleAutoRefresh()">Auto Refresh Off</button>
         <select id="autoRefreshInterval" class="auto-refresh-select" onchange="setAutoRefreshInterval(this.value)" aria-label="Auto refresh interval">
@@ -1879,6 +3051,7 @@ ${buildCss()}
         <h2>Transaction Drilldown</h2>
         <span id="drilldownCount">${esc(buildDrilldownCountText(drilldownRows.length, filters))}</span>
       </div>
+      ${buildDrilldownFilterHtml(filters)}
     </div>
     ${buildTableHtml(drilldownRows, filters)}
   </section>
@@ -1894,6 +3067,7 @@ ${buildScript(suiteletUrl, filters)}
 `;
   }
 
+  // Formats the generated-at timestamp for display in the top bar.
   function formatLastRefreshedText(value) {
     const refreshedAt = value ? new Date(value) : new Date();
 
@@ -1914,6 +3088,7 @@ ${buildScript(suiteletUrl, filters)}
       suffix;
   }
 
+  // Renders setup help when the response custom record type is missing or invalid.
   function buildSourceHelpHtml(data) {
     const candidates = data.candidates || [];
 
@@ -1939,6 +3114,8 @@ ${buildScript(suiteletUrl, filters)}
 </section>`;
   }
 
+  // Warns users when the search hit CONFIG.queryLimit and the results may be
+  // incomplete for the selected range.
   function buildQueryLimitWarningHtml(searchStats) {
     if (!searchStats || !searchStats.hitQueryLimit) return '';
 
@@ -1947,18 +3124,23 @@ ${buildScript(suiteletUrl, filters)}
     return `<div class="warning-banner">Showing first ${esc(queryLimit)} searched records. Narrow date range for complete results.</div>`;
   }
 
+  // Formats integer counts with thousands separators.
   function formatWholeNumber(value) {
     return String(Number(value || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
+  // Human label for the selected view mode.
   function getViewModeLabel(viewMode) {
     return viewMode === 'HISTORY' ? 'History view' : 'Current status view';
   }
 
+  // Drilldown row labels vary because current view deduplicates rows while
+  // history view shows actual response records.
   function getDrilldownRecordLabel(filters) {
     return filters && filters.viewMode === 'HISTORY' ? 'response record(s)' : 'current transaction record(s)';
   }
 
+  // Builds the compact insight-card row above the main charts.
   function buildInsightsHtml(insights) {
     const cards = [
       {
@@ -1996,6 +3178,7 @@ ${buildScript(suiteletUrl, filters)}
       </div>`).join('')}</div>`;
   }
 
+  // Modal markup used for long integration return messages.
   function buildMessageModalHtml() {
     return `
 <div id="messageModal" class="modal-backdrop" aria-hidden="true">
@@ -2009,6 +3192,8 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Builds the filter toolbar. Hidden fields carry state that is not shown as a
+  // normal text/select control.
   function buildFilterHtml(filters, recordType) {
     const recordTypeInputHtml = recordType ? `
   <input id="recordType" type="hidden" value="${escAttr(recordType)}">` : `
@@ -2027,6 +3212,7 @@ ${buildScript(suiteletUrl, filters)}
   <button type="button" class="preset-btn${getPresetButtonClass(filters, 'ALL')}" onclick="setDatePreset('ALL')">All</button>
 </div>
 <div class="filters">
+  <input id="loadToStatusFilter" type="hidden" value="${filters.loadToStatus ? 'T' : 'F'}">
   ${recordTypeInputHtml}
   <label>View
     <input id="viewMode" type="hidden" value="${escAttr(filters.viewMode || 'CURRENT')}">
@@ -2051,12 +3237,18 @@ ${buildScript(suiteletUrl, filters)}
       ${buildCategoryOptions(filters.category)}
     </select>
   </label>
+  <label>TO Status
+    <select id="toStatusFilter">
+      ${buildTransferOrderStatusOptions(filters.toStatus)}
+    </select>
+  </label>
   <label>Search
     <input id="globalSearch" type="text" value="${escAttr(filters.search)}" placeholder="PO, message, order number">
   </label>
 </div>`;
   }
 
+  // Option list for integration status filters.
   function buildStatusOptions(selected) {
     return [
       { value: 'ALL', text: 'All' },
@@ -2068,6 +3260,7 @@ ${buildScript(suiteletUrl, filters)}
     }).join('');
   }
 
+  // Option list for inferred integration categories.
   function buildCategoryOptions(selected) {
     return [
       { value: 'ALL', text: 'All' },
@@ -2083,6 +3276,19 @@ ${buildScript(suiteletUrl, filters)}
     }).join('');
   }
 
+  // Option list for tracked transfer-order statuses.
+  function buildTransferOrderStatusOptions(selected) {
+    return [
+      { value: 'ALL', text: 'All' },
+      { value: 'PENDING_FULFILLMENT', text: 'Pending Fulfillment' },
+      { value: 'PARTIALLY_FULFILLED', text: 'Partially Fulfilled' },
+      { value: 'CLOSED', text: 'Closed' }
+    ].map(o => {
+      return `<option value="${o.value}" ${selected === o.value ? 'selected' : ''}>${o.text}</option>`;
+    }).join('');
+  }
+
+  // Builds clickable KPI cards. Each card applies a filter when clicked.
   function buildKpiHtml(summary) {
     const comparison = summary.comparison || {};
     const cards = [
@@ -2096,13 +3302,14 @@ ${buildScript(suiteletUrl, filters)}
     ];
 
     return `<div class="kpi-grid">${cards.map(c => `
-      <button type="button" class="kpi-card ${c.className}" onclick="${escAttr(c.action)}" title="Apply ${escAttr(c.label)} filter">
+      <button type="button" class="kpi-card ${c.className}" onclick="${escAttr(c.action)}" title="${escAttr(c.title || ('Apply ' + c.label + ' filter'))}">
         <div class="kpi-label">${esc(c.label)}</div>
         <div class="kpi-value">${esc(c.value)}</div>
         ${buildKpiDeltaHtml(c, comparison)}
       </button>`).join('')}</div>`;
   }
 
+  // Builds the previous-period delta line for a KPI card, when available.
   function buildKpiDeltaHtml(card, comparison) {
     const deltaText = card.delta || buildKpiDeltaText(comparison[card.deltaKey]);
 
@@ -2111,6 +3318,7 @@ ${buildScript(suiteletUrl, filters)}
     return `<div class="kpi-delta ${escAttr(getKpiDeltaTone(comparison[card.deltaKey], card.deltaGoodWhenUp))}">${esc(deltaText)}</div>`;
   }
 
+  // Formats comparison delta text for counts and percentages.
   function buildKpiDeltaText(comparisonValue) {
     if (!comparisonValue) return '';
 
@@ -2122,6 +3330,7 @@ ${buildScript(suiteletUrl, filters)}
     return '(' + sign + absDelta + suffix + ' vs prior)';
   }
 
+  // Determines whether a KPI delta should be styled good, bad, or neutral.
   function getKpiDeltaTone(comparisonValue, goodWhenUp) {
     if (!comparisonValue || goodWhenUp === null) return 'neutral';
 
@@ -2131,11 +3340,13 @@ ${buildScript(suiteletUrl, filters)}
     return (delta > 0) === !!goodWhenUp ? 'good' : 'bad';
   }
 
+  // Formats percentages without a trailing .0 when possible.
   function formatRateValue(value) {
     const rounded = Math.round(Number(value || 0) * 10) / 10;
     return rounded % 1 === 0 ? String(Math.round(rounded)) : String(rounded);
   }
 
+  // Builds the combined bar/line SVG for success, failure, and unknown counts.
   function buildTrendSvg(trend) {
     const width = 900;
     const height = 330;
@@ -2161,6 +3372,7 @@ ${buildScript(suiteletUrl, filters)}
       max
     });
 
+    // One grouped set of three bars is generated for each daily/weekly bucket.
     const trendPieces = trend.map((d, i) => {
       const groupX = left + (slot * i) + ((slot - groupWidth) / 2);
       const labelX = left + (slot * i) + (slot / 2);
@@ -2184,6 +3396,8 @@ ${buildScript(suiteletUrl, filters)}
           `class="trend-bar trend-bar-clickable" onclick="applyTrendFilter(${jsString(s.status)},${jsString(bucketFrom)},${jsString(bucketTo)})"` :
           'class="trend-bar"';
 
+        // Bars with data are clickable; clicking filters the dashboard to the
+        // bucket date range and selected status.
         return `<rect ${clickAttrs} x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" fill="${s.fill}" rx="3"><title>${escAttr(title)} ${s.label.toLowerCase()}: ${s.value}</title></rect>`;
       }).join('');
       const labels = series.map((s, seriesIndex) => {
@@ -2208,6 +3422,8 @@ ${buildScript(suiteletUrl, filters)}
     const bars = trendPieces.map(piece => piece.rects).join('');
     const barLabels = trendPieces.map(piece => piece.labels).join('');
 
+    // Five horizontal grid lines give a rough sense of scale without requiring a
+    // full charting library.
     const grid = [0, 0.25, 0.5, 0.75, 1].map(p => {
       const y = top + plotHeight - (plotHeight * p);
       const label = Math.round(max * p);
@@ -2253,6 +3469,7 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Builds optional line overlays on top of the grouped bars.
   function buildTrendOverlayLines(trend, chart) {
     const series = [
       { key: 'success', label: 'Success', className: 'success' },
@@ -2264,6 +3481,7 @@ ${buildScript(suiteletUrl, filters)}
     return overlays ? `<g class="trend-overlay">${overlays}</g>` : '';
   }
 
+  // Builds one SVG path and markers for a single trend series.
   function buildTrendOverlaySeries(trend, chart, series) {
     const points = buildTrendOverlaySeriesPoints(trend, chart, series.key);
 
@@ -2281,6 +3499,7 @@ ${buildScript(suiteletUrl, filters)}
     return line + markers;
   }
 
+  // Converts trend buckets into chart coordinates for one metric key.
   function buildTrendOverlaySeriesPoints(trend, chart, key) {
     const baseline = chart.top + chart.plotHeight;
     const scaleMax = Math.max(1, Number(chart.max || 1));
@@ -2296,6 +3515,7 @@ ${buildScript(suiteletUrl, filters)}
     }).filter(point => point.value > 0);
   }
 
+  // Builds a smooth cubic Bezier path through trend points.
   function buildSmoothTrendPath(points) {
     if (!points.length) return '';
 
@@ -2317,10 +3537,12 @@ ${buildScript(suiteletUrl, filters)}
     return path;
   }
 
+  // Keeps SVG coordinate output compact and stable.
   function roundSvgNumber(value) {
     return Math.round(Number(value || 0) * 100) / 100;
   }
 
+  // Builds mini gauge cards that highlight lowest/highest trend values.
   function buildTrendExtremesHtml(trend) {
     const gauges = [
       {
@@ -2362,6 +3584,7 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Renders one trend gauge card with min/max details.
   function buildTrendGaugeCard(gaugeCard, scaleMax) {
     const gauge = gaugeCard.gauge;
     const min = gaugeCard.min;
@@ -2386,10 +3609,12 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Finds the shared max used to scale both gauge cards consistently.
   function getTrendGaugeScaleMax(gaugeCards) {
     return Math.max.apply(null, (gaugeCards || []).map(gaugeCard => Number(gaugeCard.max.value || 0)).concat([0]));
   }
 
+  // Builds the semi-circular SVG gauge.
   function buildTrendGaugeSvg(gauge, value, scaleMax) {
     const width = 280;
     const height = 150;
@@ -2418,15 +3643,18 @@ ${buildScript(suiteletUrl, filters)}
 </svg>`;
   }
 
+  // Converts a value into a 0-1 gauge percentage.
   function getGaugePercent(value, scaleMax) {
     if (!scaleMax) return 0;
     return Math.max(0, Math.min(1, Number(value || 0) / scaleMax));
   }
 
+  // Keeps the gauge needle away from the extreme edges of the arc.
   function getGaugeNeedlePercent(percent) {
     return 0.08 + (Math.max(0, Math.min(1, Number(percent || 0))) * 0.84);
   }
 
+  // Calculates a point on the gauge arc.
   function getGaugePoint(cx, cy, radius, percent) {
     const angle = Math.PI - (Math.PI * percent);
 
@@ -2436,6 +3664,7 @@ ${buildScript(suiteletUrl, filters)}
     };
   }
 
+  // Calculates one side of the triangular gauge needle base.
   function getGaugeNeedleBase(cx, cy, percent, offset) {
     const angle = Math.PI - (Math.PI * percent);
     const perpendicular = angle + (Math.PI / 2);
@@ -2446,6 +3675,7 @@ ${buildScript(suiteletUrl, filters)}
     };
   }
 
+  // Returns the min or max non-zero trend bucket for one metric.
   function getTrendExtreme(trend, metric, mode) {
     const rows = (trend || []).map(d => {
       return {
@@ -2469,10 +3699,12 @@ ${buildScript(suiteletUrl, filters)}
     })[0];
   }
 
+  // Adds the active class to date preset buttons.
   function getPresetButtonClass(filters, preset) {
     return getActivePresetKey(filters) === String(preset) ? ' active' : '';
   }
 
+  // Infers which date preset, if any, matches the current date range.
   function getActivePresetKey(filters) {
     const start = isoDateBoundary(filters.dateFrom, false);
     const end = isoDateBoundary(filters.dateTo, false);
@@ -2486,6 +3718,7 @@ ${buildScript(suiteletUrl, filters)}
     return '';
   }
 
+  // Builds the donut-style failure category chart.
   function buildCategoryCircle(categories) {
     if (!categories.length) return `<div class="empty-chart">No failed category data for this date range.</div>`;
 
@@ -2499,6 +3732,7 @@ ${buildScript(suiteletUrl, filters)}
     const total = categories.reduce((sum, c) => sum + Number(c.count || 0), 0);
     let angle = 0;
 
+    // Each category gets its own gradient so slice colors stay visually distinct.
     const gradients = categories.map((c, i) => {
       return `
         <linearGradient id="categoryGradient${i}" x1="0" y1="0" x2="1" y2="1">
@@ -2516,6 +3750,7 @@ ${buildScript(suiteletUrl, filters)}
       const path = describeDonutSegment(cx, cy, outerRadius, innerRadius, startAngle, endAngle);
       const textAnchor = labelPoint.x < cx - 8 ? 'end' : labelPoint.x > cx + 8 ? 'start' : 'middle';
 
+      // Carry the running angle forward as each slice consumes its share.
       angle = endAngle;
 
       return `
@@ -2567,6 +3802,7 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Converts polar coordinates into SVG cartesian coordinates.
   function polarToCartesian(cx, cy, radius, angleInDegrees) {
     const angleInRadians = (angleInDegrees - 90) * Math.PI / 180;
 
@@ -2576,6 +3812,7 @@ ${buildScript(suiteletUrl, filters)}
     };
   }
 
+  // Describes an SVG donut segment using outer and inner arcs.
   function describeDonutSegment(cx, cy, outerRadius, innerRadius, startAngle, endAngle) {
     const cappedEndAngle = Math.min(endAngle, startAngle + 359.99);
     const outerStart = polarToCartesian(cx, cy, outerRadius, cappedEndAngle);
@@ -2593,6 +3830,7 @@ ${buildScript(suiteletUrl, filters)}
     ].join(' ');
   }
 
+  // Base color for each failure category.
   function getCategoryColor(category) {
     const colors = {
       PRICE_LIST: '#f97316',
@@ -2607,6 +3845,7 @@ ${buildScript(suiteletUrl, filters)}
     return colors[category] || '#475569';
   }
 
+  // End color for each failure category gradient.
   function getCategoryGradientEndColor(category) {
     const colors = {
       PRICE_LIST: '#fb923c',
@@ -2621,6 +3860,7 @@ ${buildScript(suiteletUrl, filters)}
     return colors[category] || '#94a3b8';
   }
 
+  // Converts category keys into user-facing labels.
   function formatCategoryName(category) {
     const labels = {
       PRICE_LIST: 'Price List',
@@ -2639,6 +3879,7 @@ ${buildScript(suiteletUrl, filters)}
     return String(category || 'None').replace(/_/g, ' ').toLowerCase().replace(/\b[a-z]/g, c => c.toUpperCase());
   }
 
+  // Builds the donut chart for highest-volume PO/TO references.
   function buildTopActivityBars(items) {
     if (!items.length) return `<div class="empty-chart">No PO / TO activity for this date range.</div>`;
 
@@ -2652,6 +3893,8 @@ ${buildScript(suiteletUrl, filters)}
     const total = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
     let angle = 0;
 
+    // Palette is indexed so the same item position gets matching slice/chip
+    // colors.
     const gradients = items.map((item, i) => `
       <linearGradient id="activityGradient${i}" x1="0" y1="0" x2="1" y2="1">
         <stop offset="0%" stop-color="${getActivityColor(i)}"></stop>
@@ -2672,6 +3915,7 @@ ${buildScript(suiteletUrl, filters)}
       const connectorEnd = polarToCartesian(cx, cy, labelRadius - 20, midAngle);
       const textAnchor = labelPoint.x < cx - 8 ? 'end' : labelPoint.x > cx + 8 ? 'start' : 'middle';
 
+      // Advance the running angle after computing all geometry for this slice.
       angle = endAngle;
 
       return `
@@ -2718,16 +3962,19 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Start color for top-activity slices/chips.
   function getActivityColor(index) {
     const colors = ['#14b8a6', '#38bdf8', '#818cf8', '#db2777', '#f97316', '#f59e0b', '#84cc16', '#22c55e'];
     return colors[index % colors.length];
   }
 
+  // End color for top-activity gradients.
   function getActivityGradientEndColor(index) {
     const colors = ['#5eead4', '#7dd3fc', '#a5b4fc', '#f472b6', '#fb923c', '#fbbf24', '#bef264', '#86efac'];
     return colors[index % colors.length];
   }
 
+  // Extracts a compact order reference label from free text.
   function formatOrderReferenceLabel(value) {
     const text = String(value || '');
     const match = text.match(/#\s*([a-z]{1,5}\d+)/i) || text.match(/\b((?:to|po|so|wo)\d+)\b/i);
@@ -2737,6 +3984,7 @@ ${buildScript(suiteletUrl, filters)}
     return truncateText(text, 42);
   }
 
+  // Infers the type label for an order reference.
   function formatOrderReferenceType(value) {
     const text = String(value || '').toLowerCase();
 
@@ -2748,6 +3996,7 @@ ${buildScript(suiteletUrl, filters)}
     return 'Order Reference';
   }
 
+  // Builds the status mix visualization from summary counts.
   function buildStatusMix(summary) {
     const total = Number(summary.total || 0);
     const safeTotal = Math.max(1, total);
@@ -2762,6 +4011,8 @@ ${buildScript(suiteletUrl, filters)}
       buildStatusMixSegment('failed', 'FAILED', 'Failed', failed, failedPct, 176, 158),
       buildStatusMixSegment('unknown', 'UNKNOWN', 'Unknown', unknown, unknownPct, 226, 238)
     ];
+    // Outer circles create the soft overlapping context; inner circles carry the
+    // clickable labels and values.
     const outerCircles = segments.map(segment => `
       <circle class="mix-venn-outer ${escAttr(segment.className)}${segment.inactive ? ' inactive' : ''}" cx="${segment.x}" cy="${segment.y}" r="${segment.outerRadius}">
         <title>${esc(segment.label)}: ${esc(segment.value)} (${esc(formatRateValue(segment.pct))}%)</title>
@@ -2812,6 +4063,7 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Pre-computes geometry and label positions for one status-mix bubble.
   function buildStatusMixSegment(className, status, label, value, pct, x, y) {
     const inactive = !Number(value || 0);
     const innerRadius = inactive ? 47 : getStatusMixWeightedRadius(pct);
@@ -2837,6 +4089,8 @@ ${buildScript(suiteletUrl, filters)}
     };
   }
 
+  // Converts a percentage into a bubble radius using square-root scaling so large
+  // values do not visually dominate too aggressively.
   function getStatusMixWeightedRadius(pct) {
     const minRadius = 44;
     const maxRadius = 92;
@@ -2845,6 +4099,7 @@ ${buildScript(suiteletUrl, filters)}
     return Math.round(minRadius + (Math.sqrt(normalizedPct / 100) * (maxRadius - minRadius)));
   }
 
+  // Builds the text shown above the drilldown table.
   function buildDrilldownCountText(total, filters) {
     const recordCount = Number(total || 0);
     const label = getDrilldownRecordLabel(filters);
@@ -2854,6 +4109,8 @@ ${buildScript(suiteletUrl, filters)}
     return shown + ' of ' + recordCount + ' ' + label + ' shown';
   }
 
+  // Builds the "load next" pager shown when the table has more rows than the
+  // configured initial page size.
   function buildDrilldownPagerHtml(total, filters) {
     if (Number(total || 0) <= CONFIG.drilldownPageSize) return '';
 
@@ -2865,6 +4122,27 @@ ${buildScript(suiteletUrl, filters)}
 </div>`;
   }
 
+  // Builds in-table filters that operate on the already-rendered drilldown rows.
+  function buildDrilldownFilterHtml(filters) {
+    filters = filters || {};
+
+    return `
+<div class="drilldown-filters" aria-label="Transaction drilldown filters">
+  <select id="drilldownStatusFilter" aria-label="Drilldown status">
+    ${buildStatusOptions('ALL')}
+  </select>
+  <select id="drilldownToStatusFilter" aria-label="Drilldown TO status">
+    ${buildTransferOrderStatusOptions(filters.toStatus || 'ALL')}
+  </select>
+  <select id="drilldownCategoryFilter" aria-label="Drilldown category">
+    ${buildCategoryOptions('ALL')}
+  </select>
+  <input id="drilldownSearchFilter" type="text" placeholder="Filter rows">
+  <button type="button" class="mini-btn" onclick="clearDrilldownFilters()">Clear</button>
+</div>`;
+  }
+
+  // Builds the drilldown table shell and all row HTML.
   function buildTableHtml(rows, filters) {
     return `
 <div class="table-scroll">
@@ -2880,19 +4158,22 @@ ${buildScript(suiteletUrl, filters)}
         <th><button type="button" class="sort-btn" onclick="sortTable(6,'text')">Category <span>sort</span></button></th>
         <th><button type="button" class="sort-btn" onclick="sortTable(7,'text')">Fingerprint <span>sort</span></button></th>
         <th><button type="button" class="sort-btn" onclick="sortTable(8,'text')">PO / TO <span>sort</span></button></th>
-        <th><button type="button" class="sort-btn" onclick="sortTable(9,'text')">Sanmina Order <span>sort</span></button></th>
-        <th><button type="button" class="sort-btn" onclick="sortTable(10,'text')">Message <span>sort</span></button></th>
+        <th><button type="button" class="sort-btn" onclick="sortTable(9,'text')">TO Status <span>sort</span></button></th>
+        <th><button type="button" class="sort-btn" onclick="sortTable(10,'text')">Sanmina Order <span>sort</span></button></th>
+        <th><button type="button" class="sort-btn" onclick="sortTable(11,'text')">Message <span>sort</span></button></th>
         <th>Action</th>
       </tr>
     </thead>
     <tbody>
-      ${rows.length ? rows.map((row, index) => buildTableRowHtml(row, index)).join('') : `<tr><td colspan="12" class="empty-row">No integration records found for the selected filters. Widen the date range or clear status/search filters to inspect older responses.</td></tr>`}
+      ${rows.length ? rows.map((row, index) => buildTableRowHtml(row, index)).join('') : `<tr><td colspan="13" class="empty-row">No integration records found for the selected filters. Widen the date range or clear status/search filters to inspect older responses.</td></tr>`}
     </tbody>
   </table>
 </div>
 ${buildDrilldownPagerHtml(rows.length, filters)}`;
   }
 
+  // Renders one drilldown table row with sort/filter metadata stored as data
+  // attributes for client-side filtering and sorting.
   function buildTableRowHtml(r, index) {
     const messageId = 'msg_' + safeDomId(r.id);
     const hasLongMessage = String(r.returnMessage || '').length > 110;
@@ -2903,7 +4184,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     const hiddenStyle = rowIndex >= CONFIG.drilldownPageSize ? ' style="display:none"' : '';
 
     return `
-<tr data-drilldown-index="${rowIndex}"${hiddenStyle}>
+<tr data-drilldown-index="${rowIndex}" data-status="${escAttr(r.status)}" data-category="${escAttr(r.category)}" data-to-status="${escAttr(r.transferOrderStatusKey)}" data-filter-text="${escAttr(buildDrilldownRowFilterText(r))}"${hiddenStyle}>
   <td data-sort-value="${escAttr(Number(r.id || 0))}">${buildRecordLink(r.id, r.recordUrl)}</td>
   <td data-sort-value="${escAttr(r.name)}">${buildRecordLink(r.name, r.recordUrl)}</td>
   <td data-sort-value="${createdSortValue}">${esc(r.created)}</td>
@@ -2913,6 +4194,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
   <td data-sort-value="${escAttr(categoryLabel)}">${esc(categoryLabel)}</td>
   <td data-sort-value="${escAttr(r.failureFingerprint)}">${esc(truncateText(r.failureFingerprint, 58))}</td>
   <td data-sort-value="${escAttr(r.purchaseOrder)}">${buildSearchLink(r.purchaseOrder)}</td>
+  <td data-sort-value="${escAttr(r.transferOrderStatus)}">${buildTransferOrderStatusPill(r.transferOrderStatusKey, r.transferOrderStatus)}</td>
   <td data-sort-value="${escAttr(r.sanminaOrderNumber)}">${esc(r.sanminaOrderNumber)}</td>
   <td data-sort-value="${escAttr(r.returnMessage)}">
     <div>${esc(truncateText(r.returnMessage, 110))}</div>
@@ -2923,6 +4205,26 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
 </tr>`;
   }
 
+  // Builds the row-level text blob used by the client-side drilldown search box.
+  function buildDrilldownRowFilterText(r) {
+    return [
+      r.id,
+      r.name,
+      r.created,
+      r.status,
+      r.severity,
+      r.priority,
+      formatCategoryName(r.category),
+      r.failureFingerprint,
+      r.purchaseOrder,
+      r.transferOrderNumber,
+      r.transferOrderStatus,
+      r.sanminaOrderNumber,
+      r.returnMessage
+    ].join(' ').toLowerCase();
+  }
+
+  // Renders a safe link when href exists, or plain escaped text otherwise.
   function buildRecordLink(text, href) {
     if (!text) return '';
     if (!href) return esc(text);
@@ -2930,12 +4232,14 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     return `<a class="table-link" href="${escAttr(href)}" target="_blank" rel="noopener">${esc(text)}</a>`;
   }
 
+  // Renders a button that applies the global search filter to the given text.
   function buildSearchLink(text) {
     if (!text) return '';
 
     return `<button type="button" class="table-link link-button" onclick="applySearch(${jsString(text)})" title="Filter by ${escAttr(text)}">${esc(text)}</button>`;
   }
 
+  // Builds the retry action cell for failed rows.
   function buildRetryAction(r) {
     if (!r.retryable) return '';
 
@@ -2950,27 +4254,42 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     return `<a class="mini-btn retry-link" href="${escAttr(r.retryUrl)}" target="_blank" rel="noopener">Retry</a>`;
   }
 
+  // Builds a status pill for integration response status.
   function buildStatusPill(status) {
     const cls = status === 'SUCCESS' ? 'success' : status === 'FAILED' ? 'failed' : 'unknown';
     return `<span class="status-pill ${cls}">${esc(status)}</span>`;
   }
 
+  // Builds a transfer-order status pill when TO status enrichment is available.
+  function buildTransferOrderStatusPill(statusKey, status) {
+    if (!status) return '';
+
+    const cls = String(statusKey || normalizeTransferOrderStatusKey(status) || 'other').toLowerCase().replace(/_/g, '-');
+    return `<span class="to-status-pill ${escAttr(cls)}">${esc(status)}</span>`;
+  }
+
+  // Builds a severity pill.
   function buildSeverityPill(severity) {
     const cls = String(severity || 'Low').toLowerCase();
     return `<span class="severity-pill ${escAttr(cls)}">${esc(severity || 'Low')}</span>`;
   }
 
+  // Builds a priority pill.
   function buildPriorityPill(priority) {
     const cls = String(priority || 'P4').toLowerCase();
     return `<span class="priority-pill ${escAttr(cls)}">${esc(priority || 'P4')}</span>`;
   }
 
+  // Builds the browser-side script used by filters, paging, sorting, modal
+  // behavior, retry fetches, and auto refresh.
   function buildScript(suiteletUrl, filters) {
     const defaults = getDefaultDateRange();
     const defaultRecordType = getConfiguredRecordTypeInfo({}).recordType || CONFIG.recordType || '';
     const retryEnabled = CONFIG.enableRetry;
     return `
 <script>
+  // Values injected by the Suitelet. Keeping them in globals makes inline event
+  // handlers short and avoids repeatedly querying hidden fields.
   var SUITELET_URL = ${JSON.stringify(suiteletUrl)};
   var DEFAULT_FROM = ${JSON.stringify(defaults.dateFrom)};
   var DEFAULT_TO = ${JSON.stringify(defaults.dateTo)};
@@ -2982,30 +4301,55 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
   var AUTO_REFRESH_ENABLED_KEY = 'psiqIntegrationDashboardAutoRefreshEnabled';
   var AUTO_REFRESH_INTERVAL_KEY = 'psiqIntegrationDashboardAutoRefreshIntervalSeconds';
   var AUTO_REFRESH_DEFAULT_SECONDS = 300;
+  // Timer state for the optional auto-refresh control.
   var autoRefreshTimeout = null;
   var autoRefreshCountdownTimer = null;
   var autoRefreshTargetTime = 0;
   var autoRefreshEnabled = false;
 
-  function applyFilters(forceDefaultTo){
+  // Reads primary filters, normalizes transfer-order status state, and reloads
+  // the Suitelet with query-string parameters.
+  function applyFilters(forceDefaultTo, preserveToStatus){
     var dateToInput = document.getElementById('dateTo');
+    var selectedToStatus = getTransferOrderStatusFilterValue();
+    var loadToStatus = getLoadTransferOrderStatusValue();
 
     if(forceDefaultTo && dateToInput){
+      // Refresh actions should include today's data even if the user left an
+      // older To date selected.
       dateToInput.value = getTodayInputDate();
     }
 
+    if(!preserveToStatus){
+      selectedToStatus = 'ALL';
+      loadToStatus = 'F';
+      setTransferOrderStatusFilter('ALL');
+      setLoadTransferOrderStatus('F');
+    }
+
+    if(selectedToStatus === 'ALL' && loadToStatus !== 'ALL'){
+      loadToStatus = 'F';
+    } else if(selectedToStatus !== 'ALL'){
+      loadToStatus = 'T';
+    }
+
+    // URLSearchParams handles escaping and keeps the generated URL readable.
     var params = new URLSearchParams({
       dateFrom: document.getElementById('dateFrom').value,
       dateTo: dateToInput ? dateToInput.value : DEFAULT_TO,
       viewMode: document.getElementById('viewMode').value,
       status: document.getElementById('statusFilter').value,
       category: document.getElementById('categoryFilter').value,
+      toStatus: selectedToStatus,
+      toStatusMode: preserveToStatus && selectedToStatus !== 'ALL' ? 'FILTER' : 'DEFAULT',
+      loadToStatus: loadToStatus,
       search: document.getElementById('globalSearch').value,
       recordType: document.getElementById('recordType').value
     });
     window.location.href = SUITELET_URL + (SUITELET_URL.indexOf('?') >= 0 ? '&' : '?') + params.toString();
   }
 
+  // Initializes auto refresh from localStorage and updates the interval control.
   function initializeAutoRefresh(){
     var intervalSelect = document.getElementById('autoRefreshInterval');
     var intervalSeconds = getAutoRefreshIntervalSeconds();
@@ -3017,10 +4361,12 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     setAutoRefreshEnabled(safeLocalStorageGet(AUTO_REFRESH_ENABLED_KEY, 'F') === 'T', true);
   }
 
+  // Toggle button handler for auto refresh.
   function toggleAutoRefresh(){
     setAutoRefreshEnabled(!getStoredAutoRefreshEnabled(), false);
   }
 
+  // Enables/disables auto refresh and persists the user's preference.
   function setAutoRefreshEnabled(enabled, skipStore){
     autoRefreshEnabled = !!enabled;
 
@@ -3038,6 +4384,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     }
   }
 
+  // Updates the saved refresh interval and restarts the timer when enabled.
   function setAutoRefreshInterval(value){
     var seconds = normalizeAutoRefreshInterval(value);
     var intervalSelect = document.getElementById('autoRefreshInterval');
@@ -3053,6 +4400,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     }
   }
 
+  // Starts a one-shot reload timer plus a one-second countdown UI timer.
   function startAutoRefreshTimer(){
     var seconds = getAutoRefreshIntervalSeconds();
 
@@ -3065,6 +4413,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     updateAutoRefreshStatus();
   }
 
+  // Clears both auto-refresh timers.
   function stopAutoRefreshTimer(){
     if(autoRefreshTimeout){
       window.clearTimeout(autoRefreshTimeout);
@@ -3079,6 +4428,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     autoRefreshTargetTime = 0;
   }
 
+  // Reflects auto-refresh state in the toggle button.
   function updateAutoRefreshUi(enabled){
     var toggle = document.getElementById('autoRefreshToggle');
 
@@ -3089,6 +4439,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     else toggle.className = 'btn';
   }
 
+  // Updates the countdown text below the action buttons.
   function updateAutoRefreshStatus(){
     var status = document.getElementById('autoRefreshStatus');
     var enabled = getStoredAutoRefreshEnabled();
@@ -3104,14 +4455,17 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     status.textContent = 'Auto refresh in ' + formatAutoRefreshCountdown(remaining);
   }
 
+  // Returns the in-memory auto-refresh state.
   function getStoredAutoRefreshEnabled(){
     return autoRefreshEnabled;
   }
 
+  // Reads and validates the saved refresh interval.
   function getAutoRefreshIntervalSeconds(){
     return normalizeAutoRefreshInterval(safeLocalStorageGet(AUTO_REFRESH_INTERVAL_KEY, String(AUTO_REFRESH_DEFAULT_SECONDS)));
   }
 
+  // Allows only supported refresh intervals.
   function normalizeAutoRefreshInterval(value){
     var seconds = Number(value || AUTO_REFRESH_DEFAULT_SECONDS);
     var allowed = [60, 300, 900];
@@ -3119,6 +4473,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     return allowed.indexOf(seconds) >= 0 ? seconds : AUTO_REFRESH_DEFAULT_SECONDS;
   }
 
+  // Formats countdown seconds as M:SS.
   function formatAutoRefreshCountdown(seconds){
     var minutes = Math.floor(Number(seconds || 0) / 60);
     var remainder = Number(seconds || 0) % 60;
@@ -3126,6 +4481,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     return minutes + ':' + String(remainder).padStart(2, '0');
   }
 
+  // localStorage can be blocked in some browser contexts, so reads are guarded.
   function safeLocalStorageGet(key, fallback){
     try {
       return window.localStorage.getItem(key) || fallback;
@@ -3134,6 +4490,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     }
   }
 
+  // localStorage writes are best-effort only.
   function safeLocalStorageSet(key, value){
     try {
       window.localStorage.setItem(key, value);
@@ -3142,22 +4499,32 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     }
   }
 
+  // Restores the configured default range and clears result filters.
   function resetDefaultRange(){
     document.getElementById('dateFrom').value = DEFAULT_FROM;
     document.getElementById('dateTo').value = getTodayInputDate();
-    document.getElementById('statusFilter').value = 'ALL';
-    document.getElementById('categoryFilter').value = 'ALL';
+    resetPrimaryResultFiltersToAll();
     document.getElementById('globalSearch').value = '';
     document.getElementById('recordType').value = DEFAULT_RECORD_TYPE;
     document.getElementById('viewMode').value = 'CURRENT';
     applyFilters();
   }
 
+  // Clears primary result filters and resets TO status load state.
+  function resetPrimaryResultFiltersToAll(){
+    document.getElementById('statusFilter').value = 'ALL';
+    document.getElementById('categoryFilter').value = 'ALL';
+    setTransferOrderStatusFilter('ALL');
+    setLoadTransferOrderStatus('F');
+  }
+
+  // Switches between Current and History modes.
   function setViewMode(mode){
     document.getElementById('viewMode').value = mode === 'HISTORY' ? 'HISTORY' : 'CURRENT';
     applyFilters();
   }
 
+  // Applies a preset date range ending today.
   function setDatePreset(preset){
     var end = parseInputDate(getTodayInputDate());
     var start = new Date(end);
@@ -3175,11 +4542,13 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     applyFilters();
   }
 
+  // Parses yyyy-mm-dd values from date inputs.
   function parseInputDate(value){
     var parts = String(value || '').split('-').map(Number);
     return new Date(parts[0], parts[1] - 1, parts[2]);
   }
 
+  // Formats a Date for HTML date inputs.
   function formatInputDate(dateObj){
     return [
       dateObj.getFullYear(),
@@ -3188,47 +4557,115 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     ].join('-');
   }
 
+  // Returns today as an input-date string.
   function getTodayInputDate(){
     return formatInputDate(new Date());
   }
 
+  // Applies a custom record source selected from the setup helper.
   function useRecordType(recordType){
     document.getElementById('recordType').value = recordType || '';
     applyFilters();
   }
 
+  // Applies a failed-category filter from a chart or KPI click.
   function applyCategoryFilter(category){
     document.getElementById('statusFilter').value = 'FAILED';
     document.getElementById('categoryFilter').value = category || 'ALL';
+    setTransferOrderStatusFilter('ALL');
+    setLoadTransferOrderStatus('F');
+    document.getElementById('globalSearch').value = '';
     applyFilters();
   }
 
+  // Applies a global search value from an order-link/chart click.
   function applySearch(value){
+    document.getElementById('statusFilter').value = 'ALL';
+    document.getElementById('categoryFilter').value = 'ALL';
+    setTransferOrderStatusFilter('ALL');
+    setLoadTransferOrderStatus('F');
     document.getElementById('globalSearch').value = value || '';
     applyFilters();
   }
 
+  // Applies a primary status filter from KPI/chart clicks.
   function applyStatusFilter(status){
     document.getElementById('statusFilter').value = status || 'ALL';
     document.getElementById('categoryFilter').value = 'ALL';
+    setTransferOrderStatusFilter('ALL');
+    setLoadTransferOrderStatus('F');
+    document.getElementById('globalSearch').value = '';
     applyFilters();
   }
 
+  // Applies TO status as a server-side filter because TO status may need server
+  // enrichment before filtering can be correct.
+  function applyTransferOrderStatusFilter(statusKey){
+    document.getElementById('statusFilter').value = 'ALL';
+    document.getElementById('categoryFilter').value = 'ALL';
+    document.getElementById('globalSearch').value = '';
+    setTransferOrderStatusFilter(statusKey || 'ALL');
+    setLoadTransferOrderStatus('T');
+    applyFilters(false, true);
+  }
+
+  // Requests TO status enrichment for the current result set.
+  function loadTransferOrderStatus(statusKey){
+    if(statusKey){
+      setTransferOrderStatusFilter(statusKey);
+    }
+
+    setLoadTransferOrderStatus(getTransferOrderStatusFilterValue() === 'ALL' ? 'ALL' : 'T');
+    applyFilters(false, true);
+  }
+
+  // Reads the primary TO status filter.
+  function getTransferOrderStatusFilterValue(){
+    var field = document.getElementById('toStatusFilter');
+    return field ? (field.value || 'ALL') : 'ALL';
+  }
+
+  // Writes the primary TO status filter.
+  function setTransferOrderStatusFilter(statusKey){
+    var field = document.getElementById('toStatusFilter');
+    if(field) field.value = statusKey || 'ALL';
+  }
+
+  // Reads the hidden flag that controls server-side TO status enrichment.
+  function getLoadTransferOrderStatusValue(){
+    var field = document.getElementById('loadToStatusFilter');
+    return field ? (field.value || 'F') : 'F';
+  }
+
+  // Writes the hidden TO status enrichment flag.
+  function setLoadTransferOrderStatus(value){
+    var field = document.getElementById('loadToStatusFilter');
+    if(field) field.value = value === 'ALL' ? 'ALL' : value === 'T' ? 'T' : 'F';
+  }
+
+  // Applies date/status filters from a clicked trend bar.
   function applyTrendFilter(status, dateFrom, dateTo){
     document.getElementById('dateFrom').value = dateFrom || DEFAULT_FROM;
     document.getElementById('dateTo').value = dateTo || DEFAULT_TO;
     document.getElementById('statusFilter').value = status || 'ALL';
     document.getElementById('categoryFilter').value = 'ALL';
+    setTransferOrderStatusFilter('ALL');
+    setLoadTransferOrderStatus('F');
     document.getElementById('globalSearch').value = '';
     applyFilters();
   }
 
+  // Clears primary filters without changing the selected date range.
   function clearResultFilters(){
     document.getElementById('statusFilter').value = 'ALL';
     document.getElementById('categoryFilter').value = 'ALL';
+    setTransferOrderStatusFilter('ALL');
+    setLoadTransferOrderStatus('F');
+    document.getElementById('globalSearch').value = '';
     applyFilters();
   }
 
+  // Returns all real drilldown rows, excluding the empty-state row.
   function getDrilldownRows(){
     var table = document.getElementById('drilldownTable');
     if(!table || !table.tBodies.length) return [];
@@ -3238,18 +4675,121 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     });
   }
 
+  // Returns drilldown rows after in-table filters are applied.
+  function getFilteredDrilldownRows(){
+    return getDrilldownRows().filter(matchesDrilldownFilters);
+  }
+
+  // Tests whether one drilldown row matches the in-table filters.
+  function matchesDrilldownFilters(row){
+    var status = getSelectValue('drilldownStatusFilter');
+    var toStatus = getSelectValue('drilldownToStatusFilter');
+    var category = getSelectValue('drilldownCategoryFilter');
+    var search = getInputValue('drilldownSearchFilter').toLowerCase();
+
+    if(status !== 'ALL' && row.getAttribute('data-status') !== status) return false;
+    if(toStatus !== 'ALL' && row.getAttribute('data-to-status') !== toStatus) return false;
+    if(category !== 'ALL' && row.getAttribute('data-category') !== category) return false;
+    if(search && String(row.getAttribute('data-filter-text') || '').toLowerCase().indexOf(search) < 0) return false;
+
+    return true;
+  }
+
+  // Safe select getter with ALL fallback.
+  function getSelectValue(id){
+    var field = document.getElementById(id);
+    return field ? (field.value || 'ALL') : 'ALL';
+  }
+
+  // Safe input getter with blank fallback.
+  function getInputValue(id){
+    var field = document.getElementById(id);
+    return field ? (field.value || '') : '';
+  }
+
+  // Applies in-table drilldown filters and resets paging to the first page.
+  function applyDrilldownFilters(){
+    drilldownVisibleCount = DRILLDOWN_PAGE_SIZE;
+    updateDrilldownRowVisibility();
+  }
+
+  // Applies the drilldown TO status filter, escalating to a server reload when
+  // TO status has not yet been loaded for the current page.
+  function applyDrilldownToStatusFilter(){
+    var toStatus = getSelectValue('drilldownToStatusFilter');
+    var pageToStatus = getTransferOrderStatusFilterValue();
+
+    if(pageToStatus !== toStatus){
+      setTransferOrderStatusFilter(toStatus);
+      setLoadTransferOrderStatus(toStatus === 'ALL' ? 'F' : 'T');
+      applyFilters(false, toStatus !== 'ALL');
+      return;
+    }
+
+    if(toStatus !== 'ALL' && !isTransferOrderStatusLoadedForDrilldown()){
+      loadTransferOrderStatus(toStatus);
+      return;
+    }
+
+    applyDrilldownFilters();
+  }
+
+  // Checks whether any rendered row has TO status metadata.
+  function isTransferOrderStatusLoadedForDrilldown(){
+    if(getLoadTransferOrderStatusValue() === 'T') return true;
+
+    return getDrilldownRows().some(function(row){
+      return !!row.getAttribute('data-to-status');
+    });
+  }
+
+  // Clears in-table filters. If the page itself is filtered by TO status, reload
+  // so the server-side TO filter is removed as well.
+  function clearDrilldownFilters(){
+    var pageToStatus = getTransferOrderStatusFilterValue();
+
+    setElementValue('drilldownStatusFilter', 'ALL');
+    setElementValue('drilldownToStatusFilter', 'ALL');
+    setElementValue('drilldownCategoryFilter', 'ALL');
+    setElementValue('drilldownSearchFilter', '');
+
+    if(pageToStatus !== 'ALL'){
+      setTransferOrderStatusFilter('ALL');
+      setLoadTransferOrderStatus('F');
+      applyFilters();
+      return;
+    }
+
+    applyDrilldownFilters();
+  }
+
+  // Safe DOM value setter.
+  function setElementValue(id, value){
+    var field = document.getElementById(id);
+    if(field) field.value = value;
+  }
+
+  // Initializes drilldown paging after the table is rendered.
   function initializeDrilldownPaging(){
-    var rows = getDrilldownRows();
+    var rows = getFilteredDrilldownRows();
     drilldownVisibleCount = Math.min(DRILLDOWN_PAGE_SIZE, rows.length);
     updateDrilldownRowVisibility();
   }
 
+  // Applies current drilldown filters and page size to row display.
   function updateDrilldownRowVisibility(){
-    var rows = getDrilldownRows();
+    var allRows = getDrilldownRows();
+    var rows = getFilteredDrilldownRows();
     drilldownVisibleCount = Math.min(drilldownVisibleCount, rows.length);
 
+    allRows.forEach(function(row){
+      row.style.display = 'none';
+    });
+
     rows.forEach(function(row, index){
-      row.style.display = index < drilldownVisibleCount ? '' : 'none';
+      if(index < drilldownVisibleCount){
+        row.style.display = '';
+      }
     });
 
     var countText = document.getElementById('drilldownCount');
@@ -3270,13 +4810,17 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     }
   }
 
+  // Reveals the next page of currently filtered drilldown rows.
   function loadNextDrilldownRows(){
-    var rows = getDrilldownRows();
+    var rows = getFilteredDrilldownRows();
     drilldownVisibleCount = Math.min(rows.length, drilldownVisibleCount + DRILLDOWN_PAGE_SIZE);
     updateDrilldownRowVisibility();
   }
 
+  // Stores the current sort column/direction for the drilldown table.
   var tableSortState = {};
+
+  // Sorts drilldown rows by the selected column using data-sort-value attributes.
   function sortTable(columnIndex, type){
     var table = document.getElementById('drilldownTable');
     if(!table || !table.tBodies.length) return;
@@ -3305,6 +4849,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     updateDrilldownRowVisibility();
   }
 
+  // Reads one row's sort value for a column.
   function getTableSortValue(row, columnIndex, type){
     var cell = row.cells[columnIndex];
     var raw = cell ? (cell.getAttribute('data-sort-value') || cell.textContent || '') : '';
@@ -3316,6 +4861,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     return String(raw).toLowerCase();
   }
 
+  // Opens the full-message modal from a hidden message source div.
   function openMessageModal(sourceId){
     var source = document.getElementById(sourceId);
     var modal = document.getElementById('messageModal');
@@ -3328,6 +4874,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     modal.setAttribute('aria-hidden', 'false');
   }
 
+  // Closes the full-message modal.
   function closeMessageModal(){
     var modal = document.getElementById('messageModal');
 
@@ -3337,6 +4884,8 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     modal.setAttribute('aria-hidden', 'true');
   }
 
+  // AJAX retry handler retained for button-style retry integrations. The current
+  // table renders retry links, but this is still useful if action UI changes.
   function retryRecord(id){
     if(!RETRY_ENABLED){
       alert('Retry is disabled until retry request fields are configured.');
@@ -3362,6 +4911,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
       .catch(function(e){ alert(e.message || String(e)); });
   }
 
+  // Re-formats last refreshed text in the browser's local time zone.
   function updateLastRefreshed(){
     var node = document.getElementById('lastRefreshed');
     if(!node) return;
@@ -3375,6 +4925,27 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     node.textContent = 'Last refreshed: ' + formatClientDateTime(refreshedAt);
   }
 
+  // Cleans transient TO-status URL params after a TO status load so refreshes do
+  // not accidentally keep expensive enrichment enabled.
+  function normalizeToStatusRefreshUrl(){
+    try {
+      var currentUrl = new URL(window.location.href);
+      var toStatus = String(currentUrl.searchParams.get('toStatus') || '').toUpperCase();
+      var toStatusMode = String(currentUrl.searchParams.get('toStatusMode') || '').toUpperCase();
+      var loadToStatus = String(currentUrl.searchParams.get('loadToStatus') || '').toUpperCase();
+
+      if((toStatus && toStatus !== 'ALL') || toStatusMode === 'FILTER' || loadToStatus === 'T' || loadToStatus === 'ALL'){
+        currentUrl.searchParams.set('toStatus', 'ALL');
+        currentUrl.searchParams.set('toStatusMode', 'DEFAULT');
+        currentUrl.searchParams.set('loadToStatus', 'F');
+        window.history.replaceState(null, '', currentUrl.pathname + currentUrl.search + currentUrl.hash);
+      }
+    } catch (e) {
+      // Keep the dashboard usable if browser URL APIs are unavailable.
+    }
+  }
+
+  // Formats a Date object as m/d/yyyy h:mm AM/PM for the browser UI.
   function formatClientDateTime(dateObj){
     var hours = dateObj.getHours();
     var suffix = hours >= 12 ? 'PM' : 'AM';
@@ -3391,12 +4962,39 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
   if(searchInput){
     searchInput.addEventListener('keydown', function(e){
       if(e.key === 'Enter'){
+        // Enter in global search should apply filters instead of submitting any
+        // surrounding NetSuite form.
         e.preventDefault();
         applyFilters();
       }
     });
   }
 
+  // Wires change/input handlers for the in-table drilldown filters.
+  function initializeDrilldownFilters(){
+    ['drilldownStatusFilter','drilldownCategoryFilter'].forEach(function(id){
+      var field = document.getElementById(id);
+      if(field) field.addEventListener('change', applyDrilldownFilters);
+    });
+
+    var drilldownToStatus = document.getElementById('drilldownToStatusFilter');
+    if(drilldownToStatus){
+      drilldownToStatus.addEventListener('change', applyDrilldownToStatusFilter);
+    }
+
+    var drilldownSearch = document.getElementById('drilldownSearchFilter');
+    if(drilldownSearch){
+      drilldownSearch.addEventListener('input', applyDrilldownFilters);
+      drilldownSearch.addEventListener('keydown', function(e){
+        if(e.key === 'Escape'){
+          drilldownSearch.value = '';
+          applyDrilldownFilters();
+        }
+      });
+    }
+  }
+
+  // Click outside the modal body closes the message modal.
   var messageModal = document.getElementById('messageModal');
   if(messageModal){
     messageModal.addEventListener('click', function(e){
@@ -3404,16 +5002,23 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     });
   }
 
+  // Escape closes the modal from anywhere on the page.
   document.addEventListener('keydown', function(e){
     if(e.key === 'Escape') closeMessageModal();
   });
 
+  // Initial client-side setup after the server-rendered dashboard reaches the
+  // browser.
   updateLastRefreshed();
+  normalizeToStatusRefreshUrl();
+  initializeDrilldownFilters();
   initializeDrilldownPaging();
   initializeAutoRefresh();
 </script>`;
   }
 
+  // Returns the dashboard CSS as a single style tag. CSS is embedded so the
+  // Suitelet can be deployed as one script file without File Cabinet assets.
   function buildCss() {
     return `
 <style>
@@ -3449,13 +5054,13 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
 .mode-toggle{display:grid;grid-template-columns:1fr 1fr;margin-top:5px;border:1px solid #cbd5e1;border-radius:4px;overflow:hidden;height:34px;background:#fff}
 .mode-btn{border:0;background:#fff;color:#334155;font:inherit;font-size:12px;font-weight:800;cursor:pointer}
 .mode-btn+.mode-btn{border-left:1px solid #cbd5e1}.mode-btn.active{background:linear-gradient(135deg,#2563eb,#0ea5e9);color:#fff}.mode-btn:hover:not(.active){background:#eff6ff;color:#1d4ed8}
-.kpi-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:14px}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px}
 .kpi-card{appearance:none;text-align:left;width:100%;font:inherit;cursor:pointer;background:linear-gradient(135deg,#ffffff 0%,#f8fafc 48%,#eef2ff 100%);border:1px solid #e5e7eb;border-left:4px solid #64748b;border-radius:4px;padding:14px;box-shadow:0 1px 4px rgba(15,23,42,.08);min-height:82px}
 .kpi-card:hover{border-color:#93c5fd;box-shadow:0 4px 12px rgba(15,23,42,.12)}
 .kpi-card.good{border-left-color:#0f9f8e;background:linear-gradient(135deg,#ffffff 0%,#ecfeff 58%,#ccfbf1 100%)}.kpi-card.bad{border-left-color:#f97316;background:linear-gradient(135deg,#ffffff 0%,#fff7ed 58%,#fed7aa 100%)}.kpi-card.neutral{border-left-color:#94a3b8}.kpi-card.wide{border-left-color:#2563eb;background:linear-gradient(135deg,#ffffff 0%,#eff6ff 58%,#dbeafe 100%)}
 .kpi-label{font-size:11px;text-transform:uppercase;color:#64748b;font-weight:800;letter-spacing:.04em}
 .kpi-value{font-size:28px;color:#111827;font-weight:800;margin-top:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.kpi-card.wide .kpi-value{font-size:18px}
+.kpi-card.wide .kpi-value{font-size:18px}.kpi-card.to-status .kpi-value{font-size:24px}
 .kpi-delta{font-size:12px;font-weight:800;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kpi-delta.good{color:#047857}.kpi-delta.bad{color:#b45309}.kpi-delta.neutral{color:#64748b}
 .insight-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:14px}
 .insight-card{background:linear-gradient(135deg,#ffffff 0%,#f8fafc 52%,#eef2ff 100%);border:1px solid #e5e7eb;border-radius:4px;padding:12px 14px;box-shadow:0 1px 4px rgba(15,23,42,.08);min-height:74px}
@@ -3566,6 +5171,10 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
 .mix-venn-stat span{font-size:13px;color:#111827;font-weight:800}
 .mix-venn-stat small{grid-column:2 / span 2;color:#64748b;font-size:11px;font-weight:800}
 .table-panel{padding-bottom:10px}
+.drilldown-filters{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;max-width:820px}
+.drilldown-filters select,.drilldown-filters input{height:30px;border:1px solid #cbd5e1;background:#fff;color:#334155;border-radius:4px;padding:0 8px;font-size:12px;font-weight:800;box-sizing:border-box}
+.drilldown-filters input{width:190px;font-weight:700}
+.drilldown-filters .mini-btn{height:30px;padding:0 10px}
 .table-scroll{overflow:auto;max-height:620px;border-top:1px solid #e5e7eb}
 .drilldown-pager{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid #e5e7eb;padding:10px 0 0;margin-top:10px;color:#64748b;font-size:12px;font-weight:800}
 .drilldown-load-btn{padding:7px 11px;font-size:12px}
@@ -3580,8 +5189,9 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
 .table-link{color:#2563eb;font-weight:800;text-decoration:none}
 .table-link:hover{text-decoration:underline}
 .link-button{border:0;background:transparent;padding:0;text-align:left;cursor:pointer;font:inherit}
-.status-pill{display:inline-block;border-radius:999px;padding:4px 9px;font-weight:800;font-size:11px}
+.status-pill,.to-status-pill{display:inline-block;border-radius:999px;padding:4px 9px;font-weight:800;font-size:11px;white-space:nowrap}
 .status-pill.success{background:#ccfbf1;color:#115e59}.status-pill.failed{background:#ffedd5;color:#9a3412}.status-pill.unknown{background:#e2e8f0;color:#334155}
+.to-status-pill.pending-fulfillment{background:#fef3c7;color:#92400e}.to-status-pill.partially-fulfilled{background:#ede9fe;color:#5b21b6}.to-status-pill.closed{background:#e2e8f0;color:#334155}.to-status-pill.other{background:#eff6ff;color:#1d4ed8}
 .row-note{color:#047857;font-size:10px;font-weight:800;margin-top:5px;white-space:nowrap}
 .severity-pill,.priority-pill{display:inline-block;border-radius:999px;padding:4px 8px;font-weight:800;font-size:10px;white-space:nowrap}
 .severity-pill.critical{background:#fee2e2;color:#991b1b}.severity-pill.high{background:#ffedd5;color:#9a3412}.severity-pill.medium{background:#fef9c3;color:#854d0e}.severity-pill.low{background:#dbeafe;color:#1d4ed8}.severity-pill.info{background:#ccfbf1;color:#115e59}
@@ -3598,11 +5208,14 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
 .message-modal pre{white-space:pre-wrap;margin:0;padding:14px;overflow:auto;background:#f8fafc;color:#1f2937;font-size:13px;line-height:1.45;max-height:64vh}
 .empty-row{text-align:center;color:#64748b;font-weight:800;padding:30px!important}
 .dash-footer{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:14px;padding:12px 2px 0;border-top:1px solid #e5e7eb;color:#64748b;font-size:12px;font-weight:700}.version-badge{background:#eef2ff;border:1px solid #dbeafe;color:#334155;border-radius:999px;padding:3px 8px;font-weight:800}
-@media(max-width:1200px){.kpi-grid{grid-template-columns:repeat(3,1fr)}.insight-grid{grid-template-columns:repeat(2,1fr)}.analysis-grid,.analysis-grid.lower{grid-template-columns:1fr}}
-@media(max-width:760px){.dash-topbar{align-items:flex-start;flex-direction:column}.dash-topbar-right{width:100%;align-items:flex-start}.filters{grid-template-columns:1fr}.kpi-grid,.insight-grid,.trend-gauge-grid{grid-template-columns:1fr}.dash-actions{width:100%;flex-direction:column;align-items:stretch}.btn,.auto-refresh-select{width:100%}.dash-footer{justify-content:flex-start}.drilldown-pager{align-items:stretch;flex-direction:column}.activity-circle-legend,.category-circle-legend,.mix-venn-stats{grid-template-columns:1fr}.mix-venn-shell{min-height:250px}}
+@media(max-width:1200px){.kpi-grid{grid-template-columns:repeat(3,1fr)}.insight-grid{grid-template-columns:repeat(2,1fr)}.analysis-grid,.analysis-grid.lower{grid-template-columns:1fr}.table-panel .panel-head{flex-direction:column;gap:10px}.drilldown-filters{justify-content:flex-start;max-width:none}}
+@media(max-width:760px){.dash-topbar{align-items:flex-start;flex-direction:column}.dash-topbar-right{width:100%;align-items:flex-start}.filters{grid-template-columns:1fr}.kpi-grid,.insight-grid,.trend-gauge-grid{grid-template-columns:1fr}.dash-actions{width:100%;flex-direction:column;align-items:stretch}.btn,.auto-refresh-select{width:100%}.dash-footer{justify-content:flex-start}.drilldown-pager{align-items:stretch;flex-direction:column}.drilldown-filters{width:100%;align-items:stretch;flex-direction:column}.drilldown-filters select,.drilldown-filters input,.drilldown-filters .mini-btn{width:100%}.activity-circle-legend,.category-circle-legend,.mix-venn-stats{grid-template-columns:1fr}.mix-venn-shell{min-height:250px}}
 </style>`;
   }
 
+  // Parses NetSuite date/datetime values into JavaScript Date objects. Multiple
+  // strategies are used because search columns can return account-formatted dates,
+  // date-only strings, Date objects, or ISO-like strings.
   function parseNsDateTime(value) {
     if (!value) return null;
 
@@ -3624,6 +5237,7 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     }
 
     try {
+      // Date-only parsing is useful when search results omit time-of-day.
       const parsedDate = format.parse({
         value: String(value),
         type: format.Type.DATE
@@ -3640,38 +5254,45 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     return isNaN(nativeDate.getTime()) ? null : nativeDate;
   }
 
+  // Converts an ISO yyyy-mm-dd date string into a local Date boundary.
   function isoDateBoundary(isoDate, endOfDay) {
     const parts = String(isoDate || '').split('-').map(Number);
     const d = new Date(parts[0], parts[1] - 1, parts[2]);
 
     if (endOfDay) {
+      // Inclusive end date for NetSuite/user-facing date ranges.
       d.setHours(23, 59, 59, 999);
     }
 
     return d;
   }
 
+  // Returns the yyyy-mm-dd bucket key for a row's created value.
   function getCreatedDateKey(value) {
     const createdDate = parseNsDateTime(value);
     if (createdDate) return toIsoDate(createdDate);
     return String(value || '').substring(0, 10) || 'Unknown';
   }
 
+  // Drops time-of-day from a Date object.
   function stripTime(dateObj) {
     return new Date(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate());
   }
 
+  // Inclusive day count between two Date values.
   function getDateRangeDays(start, end) {
     const dayMs = 24 * 60 * 60 * 1000;
     return Math.max(1, Math.floor((stripTime(end).getTime() - stripTime(start).getTime()) / dayMs) + 1);
   }
 
+  // Label shown in the dashboard subtitle to explain trend bucket granularity.
   function getTrendGroupingLabel(filters) {
     const start = isoDateBoundary(filters.dateFrom, false);
     const end = isoDateBoundary(filters.dateTo, false);
     return getDateRangeDays(start, end) > 31 ? 'Grouped weekly' : 'Grouped daily';
   }
 
+  // Formats a Date as yyyy-mm-dd.
   function toIsoDate(dateObj) {
     return [
       dateObj.getFullYear(),
@@ -3680,41 +5301,52 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
     ].join('-');
   }
 
+  // Formats a Date as mm/dd for chart labels.
   function formatShortDate(dateObj) {
     return pad2(dateObj.getMonth() + 1) + '/' + pad2(dateObj.getDate());
   }
 
+  // Formats a compact mm/dd-mm/dd range for weekly chart labels.
   function formatShortDateRange(startDate, endDate) {
     return formatShortDate(startDate) + '-' + formatShortDate(endDate);
   }
 
+  // Left-pads one-digit numbers.
   function pad2(value) {
     return Number(value) < 10 ? '0' + Number(value) : String(value);
   }
 
+  // Validates the simple ISO date shape used by URL filters and inputs.
   function isIsoDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
   }
 
+  // Normalizes free text for case-insensitive matching/grouping.
   function normalizeMatchText(value) {
     return String(value || '').toLowerCase().replace(/[^a-z0-9#]+/g, ' ').replace(/\s+/g, ' ').trim();
   }
 
+  // Sanitizes values that will be used inside DOM IDs.
   function safeDomId(value) {
     return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '_');
   }
 
+  // Safely serializes a value for inclusion in an inline JavaScript call inside an
+  // HTML attribute.
   function jsString(value) {
     return escAttr(JSON.stringify(String(value == null ? '' : value)));
   }
 
+  // Truncates long display text while preserving a short suffix marker.
   function truncateText(value, maxLen) {
     const text = String(value || '');
     return text.length > maxLen ? text.substring(0, maxLen - 3) + '...' : text;
   }
 
+  // Escapes dynamic text before injecting it into INLINEHTML.
   function esc(value) {
     return String(value == null ? '' : value)
+      // Ampersand first prevents double-escaping the entities produced below.
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -3722,9 +5354,11 @@ ${buildDrilldownPagerHtml(rows.length, filters)}`;
       .replace(/'/g, '&#039;');
   }
 
+  // Escapes values used in HTML attributes and inline handlers.
   function escAttr(value) {
     return esc(value).replace(/`/g, '&#096;');
   }
 
+  // SuiteScript entry point export.
   return { onRequest };
 });

@@ -3,12 +3,15 @@
  * @NScriptType Suitelet
  *
  * PO Approval Timeline - Last 30 Days
- * Version: 1.5.15
+ * Version: 1.5.20
  * Developer: Rama Ambati
  *
  * Shows every purchase order in the selected date window with the persisted
  * approval stages created by Po_approval_timeline.js.
  */
+
+
+
 define([
   'N/ui/serverWidget',
   'N/search',
@@ -19,9 +22,11 @@ define([
   'N/file',
   'N/log'
 ], (serverWidget, search, format, url, runtime, record, file, log) => {
+  // Central runtime settings for the Suitelet. Keeping the field lists here makes
+  // it easier to add or remove NetSuite custom fields without touching query code.
   const CONFIG = {
     title: 'PO Approval Timeline - Last 30 Days',
-    version: '1.5.15',
+    version: '1.5.20',
     developerName: 'Rama Ambati',
     defaultDaysBack: 30,
     pageSize: 100,
@@ -66,6 +71,8 @@ define([
     ]
   };
 
+  // Field IDs on the persisted child approval-stage record populated by the
+  // capture script. These values are the primary source for stage timing.
   const F = {
     PARENT: 'custrecord_pas_parent_po',
     SEQ: 'custrecord_pas_seq',
@@ -80,6 +87,8 @@ define([
     IS_CURRENT: 'custrecord_pas_is_current'
   };
 
+  // Optional analytics fields can be deployed later than the base child record,
+  // so every read is guarded by an availability check before a search is built.
   const ANALYTICS_FIELDS = {
     APPROVER_TEXT: 'custrecord_pas_approver_text',
     TRANSITION_TYPE: 'custrecord_pas_transition_type',
@@ -88,6 +97,8 @@ define([
     IS_BOTTLENECK: 'custrecord_pas_is_bottleneck'
   };
 
+  // Per-request caches avoid re-probing field/record availability every time the
+  // same optional column is needed by another search.
   const STATE = {
     optionalFieldCache: {},
     transactionColumnCache: {},
@@ -99,10 +110,14 @@ define([
     const response = context.response;
 
     try {
+      // Normalize all incoming NetSuite request parameters before any data load
+      // so page rendering, CSV, and Excel export all share exactly the same rules.
       const filters = normalizeFilters(request.parameters || {});
       const data = getReportData(filters);
       const exportFormat = clean(request.parameters.export).toUpperCase();
 
+      // Export requests use the same report data as the dashboard. Only the final
+      // serializer changes, which keeps on-screen and downloaded values aligned.
       if (exportFormat === 'XLS' || exportFormat === 'EXCEL' || exportFormat === 'XLSX') {
         writeExcel(response, data);
         return;
@@ -116,6 +131,8 @@ define([
       const form = buildForm(filters, data);
       response.writePage(form);
     } catch (e) {
+      // A Suitelet error should still render a friendly NetSuite page rather than
+      // leaving the user with a raw script exception.
       log.error({
         title: 'PO approval 30 day Suitelet failed',
         details: describeError(e)
@@ -125,6 +142,8 @@ define([
   }
 
   function buildForm(filters, data) {
+    // NetSuite form fields host the filters; the main dashboard is rendered as
+    // inline HTML so the report can use a richer table layout than sublists allow.
     const form = serverWidget.createForm({ title: CONFIG.title });
 
     addFilterFields(form, filters);
@@ -142,6 +161,8 @@ define([
   }
 
   function addFilterFields(form, filters) {
+    // These field IDs are also read by normalizeFilters, so keep the IDs stable
+    // when making UI label-only changes.
     form.addFieldGroup({
       id: 'custpage_filters',
       label: 'Filters'
@@ -191,6 +212,8 @@ define([
   }
 
   function addExportLink(form, filters) {
+    // Export links round-trip the current filters and page index. This prevents
+    // the downloaded workbook from silently reverting to the default 30-day view.
     const fld = form.addField({
       id: 'custpage_export_link',
       type: serverWidget.FieldType.INLINEHTML,
@@ -220,6 +243,11 @@ define([
   }
 
   function getReportData(filters) {
+    // Data flow:
+    // 1. Load the current page of purchase orders.
+    // 2. Attach captured approval stages or fallback stages.
+    // 3. Fill milestone dates from workflow history/system notes.
+    // 4. Normalize each PO into a render/export-friendly summary row.
     const poPage = getPurchaseOrders(filters);
     const poRows = poPage.rows;
     const stagesByPo = loadStagesForPurchaseOrders(poRows, filters);
@@ -231,6 +259,8 @@ define([
     );
 
     let rows = poRows.map(po => {
+      // Captured stage records are preferred. If none exist, use a conservative
+      // current-approver fallback so pending POs still show useful context.
       const stages = stagesByPo[po.internalId] || buildCurrentApproverFallbackStages(po);
       return buildPurchaseOrderSummary(
         po,
@@ -242,10 +272,14 @@ define([
     });
 
     if (filters.timelineOnly) {
+      // The checkbox is applied after fallback construction so "timeline" means
+      // any visible timing context, not only persisted child-record stages.
       rows = rows.filter(row => row.stages.length > 0);
     }
 
     if (filters.searchText) {
+      // Broad search is applied after enrichment because requestor/approver names
+      // may come from optional fields, child records, or System Notes fallbacks.
       rows = filterRowsBySearch(rows, filters.searchText);
     }
 
@@ -261,6 +295,8 @@ define([
 
   function getPurchaseOrders(filters) {
     const rows = [];
+    // Different accounts/sandboxes may use different custom field IDs for the
+    // same business concept. Probe first, then query only columns NetSuite accepts.
     const createdDateColumnIds = getSearchableTransactionColumnIds(CONFIG.createdDateFieldIds);
     const approvalDateColumnIds = getSearchableTransactionColumnIds(CONFIG.approvalDateFieldIds);
     const requestorColumnIds = getSearchableTransactionColumnIds(CONFIG.requestorFieldIds);
@@ -278,6 +314,8 @@ define([
     const tranIdSearchText = clean(filters.searchText).replace(/\s+/g, '');
 
     if (shouldApplyTranIdSearch(tranIdSearchText)) {
+      // Use tranid filtering only for PO-like search terms. General text search
+      // happens after enrichment so vendor/requestor/approver matches still work.
       txFilters.push('AND', ['tranid', 'contains', tranIdSearchText]);
     }
 
@@ -305,6 +343,8 @@ define([
       : 0;
 
     if (pageCount) {
+      // Only fetch the requested page. The summary metrics intentionally describe
+      // the current page so the Suitelet stays fast on large date windows.
       const page = paged.fetch({ index: pageIndex });
       page.data.forEach(result => {
         const internalId = result.getValue('internalid') || '';
@@ -319,6 +359,8 @@ define([
           tranId: result.getValue('tranid') || '',
           vendor: result.getText('entity') || result.getValue('entity') || '',
           tranDate: result.getValue('trandate') || '',
+          // Prefer the earliest available created timestamp because some custom
+          // fields capture the PR/PO creation event earlier than datecreated.
           createdDate: chooseEarliestDateTimeText([alternateCreatedDateText, dateCreatedText]),
           approvalDate: approvalDateText,
           approvalStatus: result.getText('approvalstatus') || result.getValue('approvalstatus') || '',
@@ -352,6 +394,8 @@ define([
     if (!uniqueIds.length) return {};
 
     if (!isChildRecordTypeAvailable()) {
+      // If the child record has not been deployed to this account, fall back to
+      // System Notes so the report can still be used during rollout.
       log.audit({
         title: 'PO approval timeline child record unavailable',
         details: CONFIG.childRecordType + ' is not available. Loading narrowed approval System Notes timeline.'
@@ -361,6 +405,8 @@ define([
 
     try {
       const persistedStages = loadPersistedStagesForPurchaseOrders(uniqueIds);
+      // System Notes supplementation is disabled by default because persisted
+      // stages are more reliable; the flag allows controlled debugging/rollout.
       if (!CONFIG.enableSystemNoteStageSupplement) return persistedStages;
       return supplementShortTimelinesWithSystemNotes(persistedStages, uniqueIds);
     } catch (e) {
@@ -379,6 +425,8 @@ define([
     const chunks = chunkArray(poIds, 1000);
 
     chunks.forEach(idChunk => {
+      // NetSuite "anyof" filters are safest in chunks. Keep each search under the
+      // practical 1000-ID limit to avoid governance and search parser failures.
       const columns = [
         search.createColumn({ name: F.PARENT, sort: search.Sort.ASC }),
         search.createColumn({ name: F.SEQ, sort: search.Sort.ASC }),
@@ -411,6 +459,8 @@ define([
         if (!poId) return;
 
         const nameValue = result.getValue('name') || '';
+        // approverText is a denormalized display field when available. Otherwise
+        // use the list text or parse the record name as a last resort.
         const stage = {
           seq: Number(result.getValue(F.SEQ) || 0),
           approverText: opt.approverText
@@ -448,8 +498,12 @@ define([
       });
 
       byPo[poId].forEach((stage, idx) => {
+        // displaySeq is recalculated after sorting so gaps or duplicate stored
+        // sequence numbers do not confuse the UI.
         stage.displaySeq = idx + 1;
         if (!stage.isBottleneck) {
+          // Older child records may not have stored bottleneck flags. Recreate the
+          // flag from the highest business-minute stage when needed.
           stage.isBottleneck = maxBusiness > 0 && Number(stage.businessMins || 0) === maxBusiness;
         }
       });
@@ -480,6 +534,8 @@ define([
       const fromNotes = noteStages[poId] || [];
 
       if (!fromNotes.length) return;
+      // Replace only when System Notes adds more stage detail or a different
+      // approver, keeping captured child records as the default truth source.
       if (fromNotes.length > existing.length || hasNewApproverCoverage(existing, fromNotes)) {
         byPo[poId] = fromNotes;
       }
@@ -489,6 +545,8 @@ define([
   }
 
   function hasNewApproverCoverage(existingStages, candidateStages) {
+    // Compare normalized display names so "John Smith" and whitespace variants do
+    // not produce duplicate coverage decisions.
     const seen = {};
 
     (existingStages || []).forEach(stage => {
@@ -509,6 +567,8 @@ define([
 
     let available = false;
     try {
+      // Use a no-result search as a lightweight schema probe. If the record type
+      // or field permissions are missing, NetSuite throws before returning data.
       search.create({
         type: CONFIG.childRecordType,
         filters: [['internalid', 'anyof', '@NONE@']],
@@ -531,6 +591,8 @@ define([
       if (!poId || !po.orderCreator) return;
 
       const firstApprovalStage = getFirstApprovalStage(stagesByPo && stagesByPo[poId]);
+      // Only hunt for Submit for Approval timing when the PO created date appears
+      // to overlap the first approver stage. Otherwise the header date is enough.
       if (!shouldLoadWorkflowSubmitTiming(po, firstApprovalStage)) return;
 
       candidateRows.push({
@@ -542,6 +604,8 @@ define([
 
     const byPo = loadWorkflowSubmitTimingsFromTransactionSearch(candidateRows);
 
+    // Record loading is slower and can hit workflow locks, so it remains an
+    // opt-in fallback after the safer workflow-history joined search.
     if (!CONFIG.enableWorkflowRecordFallback) return byPo;
 
     candidateRows.forEach(candidate => {
@@ -555,6 +619,8 @@ define([
   }
 
   function getRequestorStartFallbackRows(poRows, stagesByPo, workflowSubmitByPo) {
+    // When workflow submit timing is unavailable, System Notes can still provide
+    // the first PO touch before the first approval stage.
     return (poRows || []).filter(po => {
       const poId = po && po.internalId ? String(po.internalId) : '';
       if (!poId || workflowSubmitByPo[poId]) return false;
@@ -587,6 +653,8 @@ define([
       const remainingPoIds = poIds.filter(poId => !byPo[poId]);
       if (!remainingPoIds.length) break;
 
+      // NetSuite workflow-history join/field casing can vary. Try known variants
+      // until one search proves readable for this account.
       if (tryWorkflowHistorySearchSpec(spec, remainingPoIds, firstApprovalStartByPo, byPo)) {
         break;
       }
@@ -609,6 +677,8 @@ define([
 
       let searchSucceeded = true;
       chunkArray(remainingPoIds, 1000).forEach(idChunk => {
+        // Controller/procurement exit marks the handoff from procurement approval
+        // to PO ordering for the dashboard milestone column.
         if (!tryWorkflowHistoryControllerExitDateSearchSpec(spec, idChunk, byPo)) {
           searchSucceeded = false;
         }
@@ -617,6 +687,8 @@ define([
       if (searchSucceeded) break;
     }
 
+    // Optional fallback uses direct record load only for POs that appear approved
+    // or terminal, reducing the chance of loading active locked workflow records.
     if (!CONFIG.enableWorkflowRecordFallback) return byPo;
 
     (poRows || []).forEach(po => {
@@ -644,6 +716,7 @@ define([
 
       let searchSucceeded = true;
       chunkArray(remainingPoIds, 1000).forEach(idChunk => {
+        // PO order date is treated as the workflow "Approved" state entered date.
         if (!tryWorkflowHistoryPoOrderDateSearchSpec(spec, idChunk, byPo)) {
           searchSucceeded = false;
         }
@@ -652,6 +725,8 @@ define([
       if (searchSucceeded) break;
     }
 
+    // Direct record fallback stays behind the config flag for the same governance
+    // and workflow-lock reasons as the procurement approval lookup.
     if (!CONFIG.enableWorkflowRecordFallback) return byPo;
 
     (poRows || []).forEach(po => {
@@ -666,6 +741,8 @@ define([
   }
 
   function getWorkflowHistoryDateSearchSpecs() {
+    // Build every known casing/field-name combination for workflow history. This
+    // avoids hard-coding one NetSuite account's internal join naming.
     const joins = ['workflowHistory', 'workflowhistory'];
     const stateFields = ['state', 'statenameinfo'];
     const enteredFields = ['dateenteredstate', 'dateEnteredState', 'dateentered'];
@@ -716,6 +793,7 @@ define([
         const entered = parseNsDateTime(enteredRaw);
         if (!entered) return;
 
+        // Keep the latest matching approved-state timestamp for each PO.
         recordWorkflowDate(outByPo, poId, entered, enteredRaw, 'Workflow History approved state');
       });
       return sawReadableWorkflowState;
@@ -757,9 +835,10 @@ define([
         const exited = parseNsDateTime(exitedRaw);
 
         if (!exited) return;
+        // Ignore malformed workflow rows where exit predates entry.
         if (entered && exited.getTime() < entered.getTime()) return;
 
-        recordWorkflowDate(outByPo, poId, exited, exitedRaw, 'Workflow History Controller exit');
+        recordProcurementApprovalWorkflowDate(outByPo, poId, stateName, exited, exitedRaw);
       });
       return sawReadableWorkflowState;
     } catch (e) {
@@ -769,6 +848,8 @@ define([
 
   function shouldLoadWorkflowMilestoneDateFallback(po) {
     if (!po) return false;
+    // Direct record fallback is most useful after approval; pending POs may still
+    // be locked by workflow and generally do not have these milestone dates yet.
     return !!po.approvalDate ||
       isApprovedStatus(po.approvalStatus) ||
       isTerminalTransactionStatus(po.transactionStatus);
@@ -793,6 +874,8 @@ define([
   }
 
   function readWorkflowMilestoneDateFromRecord(poId, statePredicate, dateMode, source) {
+    // These lists intentionally include several possible sublist/field spellings
+    // seen across NetSuite workflow history implementations.
     const preferredSublistIds = [
       'workflowhistory',
       'workflowhistorylist',
@@ -835,6 +918,8 @@ define([
         try {
           lineCount = poRec.getLineCount({ sublistId: sublistId });
         } catch (e) {
+          // Some guessed sublist IDs will not exist in the account. Treat those
+          // as empty and continue probing the remaining candidates.
           lineCount = 0;
         }
 
@@ -845,6 +930,8 @@ define([
           enteredFieldIds,
           exitedFieldIds
         ));
+        // Merge discovered fields with known field names so hidden/variant columns
+        // are still attempted when NetSuite exposes them.
         const best = readWorkflowMilestoneDateFromSublist(
           poRec,
           sublistId,
@@ -879,12 +966,16 @@ define([
       const stateName = readWorkflowStateNameMatching(lineValues, stateFieldIds, statePredicate);
       if (!statePredicate(stateName)) continue;
 
+      // For approved-state milestones we use entry time; for Controller/Procurement
+      // milestones we use exit time, depending on the caller's dateMode.
       const milestoneDate = dateMode === 'exited'
         ? readWorkflowExitedDate(lineValues, enteredFieldIds, exitedFieldIds)
         : readWorkflowEnteredDate(lineValues, enteredFieldIds);
       if (!milestoneDate || !milestoneDate.date) continue;
 
       if (!best || milestoneDate.date.getTime() > best.date.getTime()) {
+        // Workflow history may include repeat visits to the same state. The report
+        // wants the latest matching milestone because that is the final handoff.
         best = {
           date: milestoneDate.date,
           dateText: milestoneDate.text,
@@ -900,6 +991,7 @@ define([
     if (!outByPo || !poId || !date) return;
 
     const existing = outByPo[poId];
+    // Preserve the latest date if multiple workflow rows match the same PO.
     if (existing && existing.date && existing.date.getTime() >= date.getTime()) return;
 
     outByPo[poId] = {
@@ -909,7 +1001,31 @@ define([
     };
   }
 
+  function recordProcurementApprovalWorkflowDate(outByPo, poId, stateName, date, dateText) {
+    if (!outByPo || !poId || !date) return;
+
+    const priority = getProcurementApprovalStatePriority(stateName);
+    if (!priority) return;
+
+    const existing = outByPo[poId];
+    const existingPriority = Number(existing && existing.statePriority || 0);
+
+    if (existing && existing.date) {
+      if (existingPriority > priority) return;
+      if (existingPriority === priority && existing.date.getTime() >= date.getTime()) return;
+    }
+
+    outByPo[poId] = {
+      date: date,
+      dateText: formatDateTimeText(date, dateText),
+      source: priority === 2 ? 'Workflow History Procurement exit' : 'Workflow History Controller exit',
+      statePriority: priority
+    };
+  }
+
   function getWorkflowHistorySearchSpecs() {
+    // Submit-for-Approval timing needs both entry and exit dates, so this variant
+    // list includes paired date fields in addition to join/state variants.
     const joins = ['workflowHistory', 'workflowhistory'];
     const stateFields = ['state', 'statenameinfo'];
     const datePairs = [
@@ -971,6 +1087,8 @@ define([
 
         const firstApprovalStart = firstApprovalStartByPo[poId];
         const firstStageDelta = firstApprovalStart ? Math.abs(exited.getTime() - firstApprovalStart.getTime()) : 0;
+        // If several Submit for Approval rows exist, choose the one whose exit is
+        // closest to the first approver-stage start.
         if (outByPo[poId] && Number(outByPo[poId].firstStageDelta || 0) <= firstStageDelta) return;
 
         outByPo[poId] = {
@@ -992,10 +1110,14 @@ define([
     if (!firstApprovalStage || !firstApprovalStage.start) return false;
 
     const createdDate = parseNsDateTime(po && po.createdDate);
+    // A zero-minute gap suggests the first approver stage inherited the PO created
+    // date, so workflow history may reveal the real requestor submit interval.
     return !createdDate || diffMinutes(createdDate, firstApprovalStage.start) === 0;
   }
 
   function readWorkflowSubmitTimingFromRecord(poId, firstApprovalStage) {
+    // Record-load fallback mirrors the joined-search strategy but reads the
+    // workflow sublist directly when the join is unavailable.
     const preferredSublistIds = [
       'workflowhistory',
       'workflowhistorylist',
@@ -1087,6 +1209,8 @@ define([
       if (!dates || !dates.entered || !dates.exited || dates.exited.getTime() < dates.entered.getTime()) continue;
 
       const firstStageDelta = firstApprovalStart ? Math.abs(dates.exited.getTime() - firstApprovalStart.getTime()) : 0;
+      // The submit row that exits closest to the first approver start is the best
+      // proxy for the requestor's Submit for Approval action.
       if (!best || firstStageDelta < best.firstStageDelta) {
         best = {
           start: dates.entered,
@@ -1123,6 +1247,8 @@ define([
     const values = [];
 
     (fieldIds || []).forEach(fieldId => {
+      // Store only fields that returned meaningful values so the later date/state
+      // scanners can work against a compact array.
       const value = readSublistValue(rec, sublistId, line, fieldId);
       if (isEmptyValue(value)) return;
       values.push({
@@ -1138,21 +1264,25 @@ define([
     let value = '';
 
     try {
+      // Prefer display text because workflow states and employee fields are easier
+      // to match by text than by internal ID.
       value = rec.getSublistText({
         sublistId: sublistId,
         fieldId: fieldId,
         line: line
       });
-    } catch (e) {}
+    } catch (e) { }
 
     if (isEmptyValue(value)) {
       try {
+        // Fall back to raw values for date fields and cases where getSublistText
+        // is not supported by the column.
         value = rec.getSublistValue({
           sublistId: sublistId,
           fieldId: fieldId,
           line: line
         });
-      } catch (e) {}
+      } catch (e) { }
     }
 
     return isNullAdapterValue(value) ? '' : value;
@@ -1166,6 +1296,8 @@ define([
     const fromKnownField = readLineValueByFieldIds(lineValues, stateFieldIds);
     if (fromKnownField) return fromKnownField;
 
+    // If the expected state field name was not found, scan every populated value
+    // and accept the first one that matches the caller's state predicate.
     for (let i = 0; i < lineValues.length; i++) {
       if (statePredicate(lineValues[i].value)) return lineValues[i].value;
     }
@@ -1180,6 +1312,7 @@ define([
     const exited = parseWorkflowDate(exitedRaw);
 
     if (entered && exited) {
+      // Best case: the expected entry and exit fields were readable.
       return {
         entered: entered,
         enteredText: formatDateTimeText(entered, clean(enteredRaw)),
@@ -1200,6 +1333,8 @@ define([
 
     if (dateValues.length < 2) return null;
 
+    // Last resort: use the earliest and latest dates on the workflow line as
+    // approximate entry/exit values.
     dateValues.sort((a, b) => a.date.getTime() - b.date.getTime());
     return {
       entered: dateValues[0].date,
@@ -1214,6 +1349,7 @@ define([
     const entered = parseWorkflowDate(enteredRaw);
 
     if (entered) {
+      // Prefer the named "entered" field when present.
       return {
         date: entered,
         text: formatDateTimeText(entered, clean(enteredRaw))
@@ -1232,6 +1368,8 @@ define([
 
     if (!dateValues.length) return null;
 
+    // Without a named entry field, the earliest date on the line is the safest
+    // approximation for when the state began.
     dateValues.sort((a, b) => a.date.getTime() - b.date.getTime());
     return dateValues[0];
   }
@@ -1241,6 +1379,7 @@ define([
     const exited = parseWorkflowDate(exitedRaw);
 
     if (exited) {
+      // Prefer the named "exited" field when present.
       return {
         date: exited,
         text: formatDateTimeText(exited, clean(exitedRaw))
@@ -1276,6 +1415,7 @@ define([
     }
 
     const text = clean(value);
+    // Avoid handing non-date workflow values to NetSuite's date parser.
     if (!text || !/[0-9]{1,4}[\/-][0-9]{1,2}[\/-][0-9]{1,4}/.test(text)) return null;
     return parseNsDateTime(text);
   }
@@ -1291,7 +1431,7 @@ define([
           fieldId: fieldId,
           line: line
         });
-      } catch (e) {}
+      } catch (e) { }
 
       if (!value) {
         try {
@@ -1300,7 +1440,7 @@ define([
             fieldId: fieldId,
             line: line
           });
-        } catch (e) {}
+        } catch (e) { }
       }
 
       if (value) return value;
@@ -1310,10 +1450,13 @@ define([
   }
 
   function isSubmitForApprovalState(stateName) {
+    // Normalized comparisons tolerate NetSuite labels with spaces, punctuation, or
+    // different casing.
     return normalizeFieldName(stateName) === 'submitforapproval';
   }
 
   function isWorkflowApprovedState(stateName) {
+    // The workflow approved state supplies the PO Order Date milestone.
     return normalizeFieldName(stateName) === 'approved';
   }
 
@@ -1322,7 +1465,16 @@ define([
     return normalizedState === 'controller' || normalizedState === 'procurement';
   }
 
+  function getProcurementApprovalStatePriority(stateName) {
+    const normalizedState = normalizeFieldName(stateName);
+    if (normalizedState === 'procurement') return 2;
+    if (normalizedState === 'controller') return 1;
+    return 0;
+  }
+
   function hasReadableWorkflowStateName(stateName) {
+    // Used to tell the caller whether a workflow-history search spec was viable,
+    // even when no rows matched the target state.
     return /[a-z]/.test(normalizeFieldName(stateName));
   }
 
@@ -1332,6 +1484,8 @@ define([
 
     try {
       chunks.forEach(idChunk => {
+        // System Notes are queried through the transaction search because direct
+        // system note search access is not consistently available for all roles.
         const txSearch = search.create({
           type: search.Type.TRANSACTION,
           filters: [
@@ -1356,6 +1510,8 @@ define([
           const dateText = result.getValue({ name: 'date', join: 'systemNotes' }) || '';
           const fieldName = result.getValue({ name: 'field', join: 'systemNotes' }) || '';
 
+          // Only fields that can affect the approval chain are retained; this
+          // keeps noisy edit history out of fallback stage reconstruction.
           if (!poId || !dateText || !isRelevantSystemNoteField(fieldName)) return;
 
           const event = {
@@ -1386,6 +1542,7 @@ define([
     const byPo = {};
 
     Object.keys(eventsByPo).forEach(poId => {
+      // Convert raw field-change events into start/end stage intervals.
       const stages = buildStagesFromSystemNoteEvents(eventsByPo[poId], employeeMap);
       if (stages.length) byPo[poId] = decorateFallbackStages(stages);
     });
@@ -1402,6 +1559,8 @@ define([
 
     try {
       chunks.forEach(idChunk => {
+        // The first System Note approximates the earliest visible PO activity when
+        // workflow submit history cannot be read.
         const txSearch = search.create({
           type: search.Type.TRANSACTION,
           filters: [
@@ -1423,6 +1582,8 @@ define([
           const dateText = result.getValue({ name: 'date', join: 'systemNotes' }) || '';
           const date = parseNsDateTime(dateText);
 
+          // Keep the first note per PO because the search is sorted ascending by
+          // System Notes date.
           if (!poId || !date || byPo[poId]) return;
 
           byPo[poId] = {
@@ -1455,6 +1616,8 @@ define([
       workflowSubmitTiming.end &&
       workflowSubmitTiming.end.getTime() >= workflowSubmitTiming.start.getTime()
     ) {
+      // Workflow history is the best source for requestor time because it captures
+      // Submit for Approval entry and exit as explicit workflow state dates.
       return {
         start: workflowSubmitTiming.start,
         startText: workflowSubmitTiming.startText || formatDateTimeText(workflowSubmitTiming.start, ''),
@@ -1469,11 +1632,15 @@ define([
     let source = 'PO created date';
 
     if (systemNoteStart && systemNoteStart.start && end && systemNoteStart.start.getTime() < end.getTime()) {
+      // If the first System Note predates the first approver stage, it is a better
+      // requestor-start proxy than the PO header created timestamp.
       start = systemNoteStart.start;
       startText = systemNoteStart.startText || formatDateTimeText(systemNoteStart.start, '');
       source = 'First PO System Note';
     }
 
+    // Do not emit negative or incomplete intervals; the dashboard can still show
+    // approval stages without a requestor timing row.
     if (!start || !end || end.getTime() < start.getTime()) return null;
 
     return {
@@ -1488,6 +1655,8 @@ define([
   }
 
   function buildStagesFromSystemNoteEvents(events, employeeMap) {
+    // Reconstruct approval stages from the chronological stream of next approver,
+    // approver role, and document status changes.
     const sorted = (events || []).slice().sort((a, b) => a.date.getTime() - b.date.getTime());
     const stages = [];
 
@@ -1503,6 +1672,8 @@ define([
       const normalizedField = normalizeFieldName(event.field);
 
       if (isNextApproverRoleField(normalizedField)) {
+        // Role changes are metadata for the next approver stage, not a stage
+        // boundary by themselves.
         currentRole = event.newValue || currentRole;
         lastBoundaryDate = event.date || lastBoundaryDate;
         lastBoundaryText = event.dateText || lastBoundaryText;
@@ -1514,6 +1685,7 @@ define([
         const newApprover = event.newValue ? resolveSystemNoteApproverName(event.newValue, employeeMap) : '';
 
         if (currentApprover && currentStart) {
+          // A new next approver closes the current approver's interval.
           stages.push(makeFallbackStage({
             approverText: currentApprover,
             role: currentRole,
@@ -1527,6 +1699,8 @@ define([
           }));
         } else if (oldApprover && !sameCleanText(oldApprover, newApprover)) {
           const fallbackStart = lastBoundaryDate || event.date;
+          // Some System Notes only expose the old approver on the handoff event.
+          // In that case, use the previous boundary as a conservative start time.
           stages.push(makeFallbackStage({
             approverText: oldApprover,
             role: currentRole,
@@ -1552,6 +1726,8 @@ define([
         currentStatus = event.newValue || currentStatus;
 
         if (isApprovedStatus(event.newValue) && currentApprover && currentStart) {
+          // Approval status closes the final approver interval when next approver
+          // is not separately cleared.
           stages.push(makeFallbackStage({
             approverText: currentApprover,
             role: currentRole,
@@ -1575,6 +1751,8 @@ define([
 
     if (currentApprover && currentStart) {
       const now = new Date();
+      // If a next approver remains open, show it as the current active fallback
+      // stage ending at "now" so elapsed time is visible.
       stages.push(makeFallbackStage({
         approverText: currentApprover,
         role: currentRole,
@@ -1592,6 +1770,8 @@ define([
   }
 
   function makeFallbackStage(opts) {
+    // Fallback stages match the persisted-stage shape so downstream rendering and
+    // exports do not care where the stage came from.
     const calendarMins = diffMinutes(opts.start, opts.end);
     const businessMins = businessMinutesBetween(opts.start, opts.end);
 
@@ -1619,6 +1799,8 @@ define([
   function decorateFallbackStages(stages) {
     let maxBusiness = 0;
 
+    // Fallback reconstruction does not have stored sequence/bottleneck fields, so
+    // decorate after the full stage list is known.
     stages.forEach(stage => {
       maxBusiness = Math.max(maxBusiness, Number(stage.businessMins || 0));
     });
@@ -1633,6 +1815,8 @@ define([
   }
 
   function buildCurrentApproverFallbackStages(po) {
+    // Final fallback for pending POs when neither child stages nor System Notes
+    // produced a timeline.
     if (!po || isApprovedStatus(po.approvalStatus) || isTerminalTransactionStatus(po.transactionStatus)) {
       return [];
     }
@@ -1644,6 +1828,8 @@ define([
     const start = parseNsDateTime(po.createdDate) || parseDateParam(po.tranDate) || new Date();
     const now = new Date();
 
+    // Use the PO header next approver as the active stage and measure from the best
+    // available PO start date to current time.
     return decorateFallbackStages([
       makeFallbackStage({
         approverText: po.nextApprover || 'Pending Approval',
@@ -1660,6 +1846,8 @@ define([
   }
 
   function buildPurchaseOrderSummary(po, stages, requestorTiming, procurementApprovalDate, poOrderDate) {
+    // Summary rows are the single normalized data contract consumed by dashboard,
+    // CSV, and Excel renderers.
     stages = removeRedundantZeroMinuteDuplicateStages(stages || []);
 
     let totalBusiness = 0;
@@ -1674,6 +1862,8 @@ define([
     const prSubmissionDate = normalizePrSubmissionDate(requestorTiming);
 
     stages.forEach(stage => {
+      // Aggregate all timing values at the PO level and find key stages for cards
+      // and KPI pills.
       totalBusiness += Number(stage.businessMins || 0);
       totalCalendar += Number(stage.calendarMins || 0);
       totalWait += Number(stage.waitMins || 0);
@@ -1685,6 +1875,8 @@ define([
     });
 
     if (!bottleneck && stages.length) {
+      // If no source marked a bottleneck, infer it from the largest business-time
+      // stage so the dashboard always has a longest-stage answer.
       bottleneck = stages.slice().sort((a, b) => Number(b.businessMins || 0) - Number(a.businessMins || 0))[0];
     }
 
@@ -1725,6 +1917,8 @@ define([
   }
 
   function removeRedundantZeroMinuteDuplicateStages(stages) {
+    // System Notes can emit a zero-minute duplicate when a handoff and clear happen
+    // at the same timestamp. Remove only adjacent duplicates for the same approver.
     const filtered = [];
 
     (stages || []).forEach(stage => {
@@ -1748,6 +1942,8 @@ define([
     if (start.getTime() !== end.getTime()) return false;
     if (Number(stage.calendarMins || 0) !== 0 || Number(stage.businessMins || 0) !== 0) return false;
 
+    // Walk backward only through stages that ended at the same moment. Once the
+    // timestamp differs, the duplicate window has ended.
     for (let i = existingStages.length - 1; i >= 0; i--) {
       const previousStage = existingStages[i];
       const previousEnd = previousStage ? toDate(previousStage.end) : null;
@@ -1766,6 +1962,8 @@ define([
   }
 
   function normalizePrSubmissionDate(requestorTiming) {
+    // PR Submission Date is represented by the end of the requestor/creator
+    // interval, not the beginning.
     if (requestorTiming && requestorTiming.end) {
       return {
         date: requestorTiming.end,
@@ -1782,11 +1980,13 @@ define([
   }
 
   function normalizeProcurementApprovalDate(workflowApprovalDate) {
+    // Procurement Approval Date comes from the Procurement workflow state exit;
+    // Controller is retained only as a fallback for older workflow naming.
     if (workflowApprovalDate && workflowApprovalDate.date) {
       return {
         date: workflowApprovalDate.date,
         dateText: workflowApprovalDate.dateText || formatDateTimeText(workflowApprovalDate.date, ''),
-        source: workflowApprovalDate.source || 'Workflow History Controller exit'
+        source: workflowApprovalDate.source || 'Workflow History Procurement exit'
       };
     }
 
@@ -1798,6 +1998,8 @@ define([
   }
 
   function normalizePoOrderDate(po, workflowOrderDate) {
+    // Prefer the workflow approved-state date. Fall back to the PO header approval
+    // date for accounts where workflow history cannot be queried.
     if (workflowOrderDate && workflowOrderDate.date) {
       return {
         date: workflowOrderDate.date,
@@ -1817,6 +2019,8 @@ define([
   }
 
   function buildSummary(rows) {
+    // Summary metrics intentionally run over the rows currently loaded for the
+    // page, matching what the user can see/export from this Suitelet response.
     let amountTotal = 0;
     let approvedCount = 0;
     let openCount = 0;
@@ -1842,6 +2046,8 @@ define([
       }
 
       row.stages.forEach(stage => {
+        // longestStage keeps the containing PO so the hero can show both PO number
+        // and stage number.
         if (!longestStage || Number(stage.businessMins || 0) > Number(longestStage.stage.businessMins || 0)) {
           longestStage = {
             po: row,
@@ -1865,7 +2071,9 @@ define([
   }
 
   function buildDashboardHtml(data) {
-    const tableRows = buildTimelineDisplayRows(data);
+    // Dashboard HTML is assembled in sections so the same normalized data can
+    // support hero KPIs, pagination, and the wide timeline table.
+    const tableRows = buildTimelineWideDisplayRows(data);
     const rowsHtml = tableRows.length
       ? buildTimelineTableHtml(tableRows)
       : buildEmptyState(data.filters);
@@ -1891,6 +2099,8 @@ define([
   }
 
   function buildDashboardFooterHtml() {
+    // Keep version/developer metadata visible in the rendered report for support
+    // screenshots and export comparisons.
     return `
       <div class="pa-footer-meta">
         <span class="pa-pill">Version: ${esc(CONFIG.version)}</span>
@@ -1899,18 +2109,21 @@ define([
   }
 
   function buildPageCountText(pagination, poCount, detailRowCount) {
+    // Detail row count may differ from PO count when future table modes display
+    // multiple stage rows per PO.
     if (pagination && pagination.totalCount) {
       return 'Loaded ' + String(pagination.start) + '-' + String(pagination.end) +
-        ' of ' + String(pagination.totalCount) + ' POs / ' + String(detailRowCount) + ' rows shown';
+        ' of ' + String(pagination.totalCount) + ' POs / ' + String(detailRowCount) + ' PO rows shown';
     }
 
-    return String(poCount) + ' POs / ' + String(detailRowCount) + ' rows shown';
+    return String(poCount) + ' POs / ' + String(detailRowCount) + ' PO rows shown';
   }
 
   function buildPaginationHtml(data) {
     const pagination = data.pagination || {};
     if (!pagination.totalCount || pagination.pageCount <= 1) return '';
 
+    // Pagination operates over purchase orders, not stage rows.
     const prevEnabled = pagination.pageIndex > 0;
     const nextEnabled = pagination.pageIndex < pagination.pageCount - 1;
     const prevUrl = prevEnabled ? buildPageUrl(data.filters, pagination.pageIndex - 1) : '';
@@ -1927,6 +2140,8 @@ define([
   }
 
   function buildPageButton(label, href, enabled) {
+    // Disabled pager controls render as spans so NetSuite does not navigate to an
+    // empty/invalid Suitelet URL.
     if (!enabled) {
       return '<span class="pa-page-btn disabled">' + esc(label) + '</span>';
     }
@@ -1935,6 +2150,8 @@ define([
   }
 
   function buildPageUrl(filters, pageIndex) {
+    // Preserve every filter when changing pages, including the collapsed-stage
+    // view preference.
     const currentScript = runtime.getCurrentScript();
     return url.resolveScript({
       scriptId: currentScript.id,
@@ -1951,6 +2168,8 @@ define([
   }
 
   function buildHero(data) {
+    // The hero gives quick operational context: date window, visible PO count,
+    // approval split, and the longest visible approval stage.
     const filters = data.filters;
     const summary = data.summary;
     const pagination = data.pagination || {};
@@ -1974,6 +2193,8 @@ define([
   }
 
   function buildKpiGrid(data) {
+    // KPIs are current-page metrics by design; full date-window totals would
+    // require loading every page and would make the Suitelet slower.
     const summary = data.summary;
     const longestPo = summary.longestPo;
 
@@ -1989,6 +2210,8 @@ define([
   }
 
   function buildKpi(label, value, sublabel, tone) {
+    // Tone classes are escaped even though they are generated internally because
+    // the helper is used as a generic HTML builder.
     return `
       <div class="pa-kpi ${escAttr('tone-' + tone)}">
         <div class="pa-kpi-label">${esc(label)}</div>
@@ -1998,6 +2221,8 @@ define([
   }
 
   function buildTimelineDisplayRows(data) {
+    // Legacy row-per-stage shape retained for CSV and any older card/table layouts
+    // that need repeated PO fields only on the first stage row.
     const rows = [];
     const collapseStageLines = !!(data && data.filters && data.filters.collapseStageLines);
 
@@ -2019,7 +2244,43 @@ define([
     return rows;
   }
 
+  function buildTimelineWideDisplayRows(data) {
+    // The active on-screen table uses one row per PO, with stage columns repeated
+    // horizontally for easier spreadsheet-style scanning.
+    const collapseStageLines = !!(data && data.filters && data.filters.collapseStageLines);
+
+    return (data.rows || []).map((row, idx) => {
+      const stages = buildDisplayStages(row).filter(stage => !shouldHideCollapsedDisplayStage(stage, collapseStageLines));
+
+      return {
+        poTone: String(idx % 8),
+        poNumber: row.tranId || row.internalId || '',
+        poInternalId: row.internalId || '',
+        poUrl: row.url || '',
+        vendor: row.vendor || '',
+        createdDate: row.createdDate || '',
+        prSubmissionDate: formatPrSubmissionDate(row),
+        procurementApprovalDate: formatProcurementApprovalDate(row),
+        poOrderDate: formatPoOrderDate(row),
+        requestor: row.requestor || 'Unknown',
+        amount: row.amount || 0,
+        stages: stages.map(stage => ({
+          stageNumber: formatStageNumber(stage.displaySeq || stage.seq || ''),
+          approver: stage.approverText || '',
+          stageStart: formatDateTimeText(stage.start, stage.startText),
+          stageEnd: formatDateTimeText(stage.end, stage.endText),
+          businessMinutes: Number(stage.businessMins || 0),
+          businessTime: formatMinutes(stage.businessMins),
+          calendarTime: formatMinutes(stage.calendarMins),
+          currentStage: stage && stage.isCurrent ? 'Y' : ''
+        }))
+      };
+    });
+  }
+
   function buildDisplayStages(row) {
+    // Display stages include the synthetic S0 Order Creator row before approval
+    // stages, when the source data has an order creator.
     const stages = [];
     const orderCreatorStage = buildOrderCreatorDisplayStage(row);
 
@@ -2031,6 +2292,8 @@ define([
     const orderCreator = clean(row && row.orderCreator);
     if (!orderCreator) return null;
 
+    // S0 measures the order creator/requestor interval that happens before the
+    // first approval stage. This is synthetic and not stored in the child record.
     const requestorTiming = row && row.requestorTiming;
     const createdDate = requestorTiming && requestorTiming.start
       ? requestorTiming.start
@@ -2044,8 +2307,8 @@ define([
     const requestorEndText = requestorTiming && requestorTiming.endText
       ? requestorTiming.endText
       : hasApprovalStartAfterCreated
-      ? firstApprovalStage.startText || formatDateTimeText(firstApprovalStart, '')
-      : row.createdDate || '';
+        ? firstApprovalStage.startText || formatDateTimeText(firstApprovalStart, '')
+        : row.createdDate || '';
     const calendarMins = diffMinutes(createdDate, requestorEnd);
     const businessMins = requestorBusinessMinutesBetween(createdDate, requestorEnd, calendarMins);
 
@@ -2071,6 +2334,8 @@ define([
   }
 
   function getFirstApprovalStage(stages) {
+    // Stages should already be sorted, but selecting by earliest start protects
+    // callers that pass fallback or partially reconstructed data.
     let firstStage = null;
 
     (stages || []).forEach(stage => {
@@ -2084,6 +2349,8 @@ define([
   }
 
   function requestorBusinessMinutesBetween(start, end, calendarMins) {
+    // Requestor time is intentionally counted as elapsed calendar time. Business
+    // hour filtering applies to approver stages, not the creator handoff.
     return Math.max(0, Number(calendarMins || 0));
   }
 
@@ -2091,11 +2358,14 @@ define([
     if (!collapseStageLines || !stage) return false;
     if (stage.transitionType === 'Order Creator') return false;
 
+    // Collapse mode keeps S0 and S1 visible and hides approval stages 2+.
     const seq = Number(stage.displaySeq || stage.seq || 0);
     return seq > 1;
   }
 
   function buildTimelineDisplayRow(row, stage, poTone, isPoStart) {
+    // Flatten a PO/stage pair into plain display values so renderers do not need
+    // to know about Date objects or raw stage fields.
     return {
       poTone: poTone || '0',
       isPoStart: !!isPoStart,
@@ -2132,24 +2402,29 @@ define([
   }
 
   function formatPrSubmissionDate(row) {
+    // Prefer the stored display text because NetSuite date formatting is account
+    // and user-locale sensitive.
     const text = clean(row && row.prSubmissionDateText);
     if (text) return text;
     return row && row.prSubmissionDate ? formatDateTimeText(row.prSubmissionDate, '') : '';
   }
 
   function formatProcurementApprovalDate(row) {
+    // Prefer the original workflow text, then format the parsed Date if needed.
     const text = clean(row && row.procurementApprovalDateText);
     if (text) return text;
     return row && row.procurementApprovalDate ? formatDateTimeText(row.procurementApprovalDate, '') : '';
   }
 
   function formatPoOrderDate(row) {
+    // Prefer the source text so exported and on-screen values match NetSuite.
     const text = clean(row && row.poOrderDateText);
     if (text) return text;
     return row && row.poOrderDate ? formatDateTimeText(row.poOrderDate, '') : '';
   }
 
   function buildApprovalFlowSummary(stages, row) {
+    // Plain-text approval flow is used where HTML chips are not appropriate.
     const parts = [];
     const orderCreator = clean(row && row.orderCreator);
 
@@ -2157,7 +2432,7 @@ define([
       const orderCreatorStage = buildOrderCreatorDisplayStage(row);
       const s0Minutes = orderCreatorStage ? Number(orderCreatorStage.businessMins || 0) : 0;
       const timeText = s0Minutes > 0 ? ' (' + formatMinutes(s0Minutes) + ')' : '';
-      parts.push('S0 (Requestor): ' + orderCreator + timeText);
+      parts.push('S0: ' + orderCreator + timeText);
     }
 
     if (!stages || !stages.length) {
@@ -2180,13 +2455,16 @@ define([
   }
 
   function formatStageNumber(value) {
+    // Normalize numeric and S-prefixed stage values into the user-facing label.
     const text = clean(value);
     if (!text) return '';
     const stageText = /^s/i.test(text) ? text.toUpperCase() : 'S' + text;
-    return stageText === 'S0' ? 'S0 (Requestor)' : stageText;
+    return stageText;
   }
 
   function buildApprovalFlowSummaryHtml(stages, row) {
+    // Chip-based approval flow mirrors the plain summary but carries visual state
+    // for current and bottleneck stages.
     const orderCreator = clean(row && row.orderCreator);
     const flowParts = [];
 
@@ -2195,7 +2473,7 @@ define([
       const s0Minutes = orderCreatorStage ? Number(orderCreatorStage.businessMins || 0) : 0;
       const timeText = s0Minutes > 0 ? '(' + formatMinutes(s0Minutes) + ')' : '(0m)';
       flowParts.push('<span class="pa-flow-chip flow-tone-s0">' +
-        '<span class="pa-flow-stage">S0 (Requestor):</span>' +
+        '<span class="pa-flow-stage">S0:</span>' +
         '<span class="pa-flow-name">' + esc(orderCreator) + '</span>' +
         '<span class="pa-flow-time">' + esc(timeText) + '</span>' +
         '</span>' + ((stages && stages.length) || shouldShowFlowEnd(row) ? '<span class="pa-flow-step-arrow">-&gt;</span>' : ''));
@@ -2236,45 +2514,146 @@ define([
   }
 
   function shouldShowFlowEnd(row) {
+    // Only approved POs get an explicit End marker; open POs end at the current
+    // active approver or last captured stage.
     return !!row && isApprovedStatus(row.approvalStatus);
   }
 
   function buildTimelineTableHtml(rows) {
+    // Determine the widest stage count on the page and repeat the stage columns so
+    // every PO row has the same shape.
+    const maxStageCount = Math.max(1, rows.reduce((max, row) => Math.max(max, row.stages.length), 0));
+    const headers = [
+      { label: 'PO #', className: 'pa-sticky-col pa-sticky-po' },
+      { label: 'Vendor', className: 'pa-sticky-col pa-sticky-vendor' },
+      { label: 'Created Date' },
+      { label: 'PR Submission Date' },
+      { label: 'Procurement Approval Date' },
+      { label: 'PO Order Date' },
+      { label: 'Requestor' },
+      { label: 'Amount' }
+    ];
+    for (let i = 0; i < maxStageCount; i++) {
+      headers.push.apply(headers, buildStageGroupHeaders(i));
+    }
+
     return `
       <div class="pa-table-wrap">
-        <table class="pa-table">
+        <table class="pa-table pa-table-wide" style="min-width:${escAttr(String(getTimelineTableWidth(maxStageCount)))}px">
+          ${buildTimelineColumnGroup(maxStageCount)}
           <thead>
             <tr>
-              <th class="pa-sticky-col pa-sticky-po">PO #</th>
-              <th class="pa-sticky-col pa-sticky-vendor">Vendor</th>
-              <th>PO Date</th>
-              <th>PR Submission Date</th>
-              <th>Procurement Approval Date</th>
-              <th>PO Order Date</th>
-              <th>Requestor</th>
-              <th>Amount</th>
-              <th>Stage #</th>
-              <th>Approver</th>
-              <th>Stage Start</th>
-              <th>Stage End</th>
-              <th>Business Time</th>
-              <th>Calendar Time</th>
+              ${headers.map(buildTimelineHeaderCellHtml).join('')}
             </tr>
           </thead>
           <tbody>
-            ${rows.map(buildTimelineTableRowHtml).join('')}
+            ${rows.map(row => buildTimelineWideTableRowHtml(row, maxStageCount)).join('')}
           </tbody>
         </table>
       </div>`;
   }
 
+  function buildTimelineColumnGroup(stageCount) {
+    // Fixed widths keep sticky columns and repeated stage groups aligned during
+    // horizontal scrolling.
+    const widths = [100, 190, 165, 165, 200, 165, 150, 90];
+    for (let i = 0; i < stageCount; i++) {
+      widths.push(100, 165, 155, 155, 120, 120);
+    }
+
+    return '<colgroup>' + widths.map(width => '<col style="width:' + escAttr(String(width)) + 'px" />').join('') + '</colgroup>';
+  }
+
+  function buildStageGroupHeaders(stageIndex) {
+    return [
+      { label: 'Stage #', className: 'pa-stage-group-start' },
+      { label: Number(stageIndex || 0) === 0 ? 'Creator' : 'Approver' },
+      { label: 'Stage Start' },
+      { label: 'Stage End' },
+      { label: 'Business Time' },
+      { label: 'Calendar Time' }
+    ];
+  }
+
+  function getTimelineTableWidth(stageCount) {
+    // Base columns are about 1225px wide; each stage adds six more columns.
+    return 1225 + (Number(stageCount || 1) * 815);
+  }
+
+  function buildTimelineHeaderCellHtml(header) {
+    // Header objects can optionally carry sticky/group-start classes.
+    const classAttr = header.className ? ' class="' + escAttr(header.className) + '"' : '';
+    return '<th' + classAttr + '>' + esc(header.label) + '</th>';
+  }
+
+  function buildTimelineWideTableRowHtml(row, maxStageCount) {
+    // Build all cells as strings first so blank stage groups can be padded to the
+    // page maximum stage count.
+    const poValue = row.poUrl
+      ? '<a href="' + escAttr(row.poUrl) + '" target="_blank" rel="noopener">' + esc(row.poNumber) + '</a>'
+      : esc(row.poNumber);
+    const hasCurrentStage = (row.stages || []).some(stage => stage.currentStage);
+    const rowClasses = [
+      'pa-po-tone-' + (row.poTone || '0'),
+      getTransactionNumberRowClass(row.poNumber),
+      hasCurrentStage ? 'pa-current-row' : ''
+    ].filter(Boolean).join(' ');
+    const cells = [
+      '<td class="pa-nowrap pa-strong pa-sticky-col pa-sticky-po">' + poValue + '</td>',
+      '<td class="pa-sticky-col pa-sticky-vendor">' + esc(row.vendor) + '</td>',
+      '<td class="pa-nowrap">' + esc(row.createdDate) + '</td>',
+      '<td class="pa-nowrap">' + esc(row.prSubmissionDate) + '</td>',
+      '<td class="pa-nowrap">' + esc(row.procurementApprovalDate) + '</td>',
+      '<td class="pa-nowrap">' + esc(row.poOrderDate) + '</td>',
+      '<td>' + esc(row.requestor) + '</td>',
+      '<td class="pa-num">' + esc(formatCurrency(row.amount)) + '</td>'
+    ];
+
+    for (let i = 0; i < maxStageCount; i++) {
+      const stage = row.stages[i];
+      if (!stage) {
+        // Empty stage columns preserve table alignment for POs with fewer stages.
+        cells.push(
+          '<td class="pa-stage-group-start"></td>',
+          '<td></td>',
+          '<td></td>',
+          '<td></td>',
+          '<td></td>',
+          '<td></td>'
+        );
+        continue;
+      }
+
+      const isBusinessOverDay = Number(stage.businessMinutes || 0) >= 1440;
+      // Long waits get a visual badge so the table can be scanned quickly.
+      const businessTimeHtml = isBusinessOverDay
+        ? '<span class="pa-time-badge over-day">' + esc(stage.businessTime) + '</span>'
+        : esc(stage.businessTime);
+      const businessTimeClass = isBusinessOverDay ? ' pa-business-over-day' : '';
+
+      cells.push(
+        '<td class="pa-nowrap pa-num pa-stage-group-start">' + esc(stage.stageNumber) + '</td>',
+        '<td>' + esc(stage.approver) + '</td>',
+        '<td class="pa-nowrap">' + esc(stage.stageStart) + '</td>',
+        '<td class="pa-nowrap">' + esc(stage.stageEnd) + '</td>',
+        '<td class="' + escAttr('pa-nowrap' + businessTimeClass) + '">' + businessTimeHtml + '</td>',
+        '<td class="pa-nowrap">' + esc(stage.calendarTime) + '</td>'
+      );
+    }
+
+    return '<tr class="' + escAttr(rowClasses) + '">' + cells.join('') + '</tr>';
+  }
+
   function buildTimelineTableRowHtml(row) {
+    // Older vertical table renderer retained as a fallback/reference for row-per-
+    // stage layouts.
     const poValue = row.poUrl
       ? '<a href="' + escAttr(row.poUrl) + '" target="_blank" rel="noopener">' + esc(row.poNumber) + '</a>'
       : esc(row.poNumber);
     const showPoFields = !!row.showPoFields;
     const rowClasses = [
       'pa-po-tone-' + (row.poTone || '0'),
+      getTransactionNumberRowClass(row.poNumber),
       row.isPoStart ? 'pa-po-start' : '',
       row.currentStage ? 'pa-current-row' : ''
     ].filter(Boolean).join(' ');
@@ -2304,13 +2683,25 @@ define([
   }
 
   function buildStatusBadge(statusText) {
+    // Status badges are currently used by card layouts and kept available for
+    // future dashboard variants.
     const text = clean(statusText);
     if (!text) return '';
 
     return '<span class="pa-status-badge ' + escAttr(getStatusClass(text)) + '">' + esc(text) + '</span>';
   }
 
+  function getTransactionNumberRowClass(transactionNumber) {
+    const text = clean(transactionNumber).toUpperCase();
+
+    if (text.indexOf('PR02') === 0) return 'pa-row-pr';
+    if (text.indexOf('PO0') === 0) return 'pa-row-po';
+    return '';
+  }
+
   function getStatusClass(statusText) {
+    // Classify by text fragments because NetSuite status labels vary by account
+    // and transaction lifecycle.
     const status = clean(statusText).toLowerCase();
 
     if (!status) return 'status-neutral';
@@ -2323,6 +2714,8 @@ define([
   }
 
   function buildPoCardHtml(row) {
+    // Card layout is retained for alternate/mobile-style presentation, although
+    // the current dashboard prefers the wide table.
     const flowHtml = row.stages.length ? buildFlowHtml(row.stages) : '<div class="pa-no-flow">No approval stages captured for this PO.</div>';
     const stageGridHtml = row.stages.length ? buildStageGridHtml(row) : '';
     const poTitle = row.url
@@ -2356,18 +2749,20 @@ define([
   }
 
   function buildFlowHtml(stages) {
+    // Simple flow pills for the card layout.
     return `
       <div class="pa-flow">
         ${stages.map((stage, idx) => {
-          const label = 'S' + String(idx + 1) + ': ' + (stage.approverText || 'Unknown');
-          const arrow = idx < stages.length - 1 ? '<span class="pa-arrow">&rarr;</span>' : '';
-          const cls = stage.isCurrent ? 'pa-flow-pill current' : stage.isBottleneck ? 'pa-flow-pill bottleneck' : 'pa-flow-pill';
-          return '<span class="' + escAttr(cls) + '">' + esc(label) + '</span>' + arrow;
-        }).join('')}
+      const label = 'S' + String(idx + 1) + ': ' + (stage.approverText || 'Unknown');
+      const arrow = idx < stages.length - 1 ? '<span class="pa-arrow">&rarr;</span>' : '';
+      const cls = stage.isCurrent ? 'pa-flow-pill current' : stage.isBottleneck ? 'pa-flow-pill bottleneck' : 'pa-flow-pill';
+      return '<span class="' + escAttr(cls) + '">' + esc(label) + '</span>' + arrow;
+    }).join('')}
       </div>`;
   }
 
   function buildStageGridHtml(row) {
+    // Requestor card plus one card per approval stage for the card layout.
     const requestorCard = `
       <div class="pa-stage-card requestor">
         <div class="pa-card-title">Requestor</div>
@@ -2382,6 +2777,7 @@ define([
   }
 
   function buildStageCardHtml(stage, stageNum) {
+    // Stage cards expose detail fields that are too verbose for the wide table.
     const classes = [
       'pa-stage-card',
       stage.isCurrent ? 'current' : '',
@@ -2408,6 +2804,8 @@ define([
   }
 
   function buildEmptyState(filters) {
+    // Empty state still echoes the active date range so users can confirm which
+    // filter produced no matches.
     return `
       <div class="pa-empty">
         <div class="pa-empty-title">No purchase orders found</div>
@@ -2416,6 +2814,8 @@ define([
   }
 
   function buildCss() {
+    // Inline CSS keeps the Suitelet self-contained; no File Cabinet asset needs to
+    // be deployed separately for the dashboard to render.
     return `
       <style>
         .pa-wrap{font-family:Arial,Helvetica,sans-serif;background:#f6f8fb;border:1px solid #dbe5f1;border-radius:6px;padding:14px;margin-top:8px;color:#182033}
@@ -2474,12 +2874,23 @@ define([
         .pa-table tbody tr.pa-current-row{background:#dff4ff}
         .pa-table tbody tr.pa-current-row td{border-top-color:#a7d8f5;border-bottom:1px solid #a7d8f5}
         .pa-table tbody tr.pa-current-row td.pa-sticky-col{background:#dff4ff}
+        .pa-table tbody tr.pa-row-pr{background:#fff3c4}
+        .pa-table tbody tr.pa-row-pr td.pa-sticky-col{background:#fff3c4}
+        .pa-table tbody tr.pa-row-pr td:first-child{border-left:4px solid #d97706}
+        .pa-table tbody tr.pa-row-po{background:#dcfce7}
+        .pa-table tbody tr.pa-row-po td.pa-sticky-col{background:#dcfce7}
+        .pa-table tbody tr.pa-row-po td:first-child{border-left:4px solid #16a34a}
         .pa-table tbody tr:hover{background:#eef6ff}
         .pa-table tbody tr:hover td.pa-sticky-col{background:#eef6ff}
         .pa-table tbody tr.pa-current-row:hover{background:#d7ecff}
         .pa-table tbody tr.pa-current-row:hover td.pa-sticky-col{background:#d7ecff}
+        .pa-table tbody tr.pa-row-pr:hover{background:#ffe8a3}
+        .pa-table tbody tr.pa-row-pr:hover td.pa-sticky-col{background:#ffe8a3}
+        .pa-table tbody tr.pa-row-po:hover{background:#bbf7d0}
+        .pa-table tbody tr.pa-row-po:hover td.pa-sticky-col{background:#bbf7d0}
         .pa-table a{color:#153f73;font-weight:800;text-decoration:none}
         .pa-table a:hover{text-decoration:underline}
+        .pa-table th.pa-stage-group-start,.pa-table td.pa-stage-group-start{border-left:3px solid #8aa6cc}
         .pa-table td.pa-business-over-day{background:#fff7ed;color:#955300;font-weight:800;box-shadow:inset 4px 0 0 #d9981e}
         .pa-time-badge{display:inline-block;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:900;line-height:1.2;white-space:nowrap}
         .pa-time-badge.over-day{background:linear-gradient(135deg,#ffedd5 0%,#fed7aa 55%,#fff7ed 100%);border:1px solid #fb923c;color:#9a3412}
@@ -2543,6 +2954,8 @@ define([
   }
 
   function writeCsv(response, data) {
+    // CSV export uses the row-per-stage shape so downstream spreadsheet users can
+    // filter/sort stages independently.
     const rows = [];
 
     rows.push(['PO Approval Timeline - Last 30 Days']);
@@ -2555,7 +2968,7 @@ define([
       'PO #',
       'PO Internal ID',
       'Vendor',
-      'PO Date',
+      'Created Date',
       'PR Submission Date',
       'Procurement Approval Date',
       'PO Order Date',
@@ -2575,6 +2988,8 @@ define([
       const displayStages = buildDisplayStages(row);
 
       if (!displayStages.length) {
+        // Keep one row for POs without timeline stages so the export matches the
+        // visible PO list.
         rows.push(buildCsvStageRow(row, null, true));
         return;
       }
@@ -2597,6 +3012,8 @@ define([
   }
 
   function writeExcel(response, data) {
+    // NetSuite can stream an HTML document as an .xls file; Excel opens the styled
+    // table while avoiding external spreadsheet libraries.
     const workbook = buildExcelHtml(data);
     const excelFile = file.create({
       name: 'PO_Approval_Timeline_Last_30_Days.xls',
@@ -2611,34 +3028,43 @@ define([
   }
 
   function buildExcelHtml(data) {
-    const detailRows = buildTimelineDisplayRows(data);
+    // Excel-specific markup keeps the first row frozen and preserves basic number
+    // and datetime formatting in the downloaded workbook.
     return [
       '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">',
       '<head>',
       '<meta http-equiv="Content-Type" content="application/vnd.ms-excel; charset=utf-8" />',
+      '<!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet><x:Name>PO Timeline</x:Name><x:WorksheetOptions><x:FreezePanes/><x:FrozenNoSplit/><x:SplitHorizontal>1</x:SplitHorizontal><x:TopRowBottomPane>1</x:TopRowBottomPane><x:ActivePane>2</x:ActivePane></x:WorksheetOptions></x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]-->',
       '<style>',
-      'body{font-family:Arial,Helvetica,sans-serif;font-size:10pt;color:#172033}',
-      'h1{font-size:16pt;color:#153f73}',
-      'h2{font-size:12pt;color:#153f73;margin-top:18px}',
-      'table{border-collapse:collapse}',
-      'th{background:#5f789d;color:#ffffff;font-weight:bold;border:1px solid #d9e1ef;padding:6px;white-space:nowrap}',
-      'td{border:1px solid #d9e1ef;padding:5px;vertical-align:top}',
-      '.label{font-weight:bold;color:#153f73;background:#eef3fb}',
-      '.number{text-align:right;mso-number-format:"0.00"}',
-      '.minutes{text-align:right;mso-number-format:"0"}',
+      'body{font-family:Arial,Helvetica,sans-serif;font-size:10pt;color:#172033;margin:0}',
+      'table.timeline{border-collapse:collapse;mso-table-lspace:0;mso-table-rspace:0}',
+      'th{background:#5f789d;color:#ffffff;font-weight:bold;border:1px solid #c8d6ea;padding:7px 9px;white-space:nowrap;text-align:left}',
+      'td{border:1px solid #e5edf6;padding:6px 9px;vertical-align:top;white-space:nowrap}',
+      'tr.tone-0 td{background:#fff7ed}',
+      'tr.tone-1 td{background:#f5f3ff}',
+      'tr.tone-2 td{background:#eef6ff}',
+      'tr.tone-3 td{background:#f0fdf4}',
+      'tr.tone-4 td{background:#fff1f2}',
+      'tr.tone-5 td{background:#f0fdfa}',
+      'tr.tone-6 td{background:#f8fafc}',
+      'tr.tone-7 td{background:#ffffff}',
+      '.po-number{font-weight:bold;color:#153f73;mso-number-format:"\\@"}',
+      '.number{text-align:right;mso-number-format:"#,##0.00"}',
+      '.date{mso-number-format:"m\\/d\\/yy"}',
+      '.datetime{mso-number-format:"m\\/d\\/yy h:mm AM\\/PM"}',
+      '.time-text{mso-number-format:"\\@"}',
       '.nowrap{white-space:nowrap}',
       '</style>',
       '</head>',
       '<body>',
-      '<h1>PO Approval Timeline - Last 30 Days</h1>',
-      buildExcelSummaryHtml(data),
-      '<h2>Timeline Data</h2>',
-      buildExcelTimelineHtml(detailRows),
+      buildExcelTimelineHtml(data),
       '</body></html>'
     ].join('');
   }
 
   function buildExcelSummaryHtml(data) {
+    // Summary table is retained for possible workbook expansion; the current
+    // export writes the timeline sheet only.
     const summary = data.summary;
     const longestPo = summary.longestPo;
     const longestStage = summary.longestStage;
@@ -2664,60 +3090,121 @@ define([
     return '<table>' + rows.map(row => '<tr><td class="label">' + esc(row[0]) + '</td><td>' + esc(row[1]) + '</td></tr>').join('') + '</table>';
   }
 
-  function buildExcelTimelineHtml(rows) {
+  function buildExcelTimelineHtml(data) {
+    // Excel export mirrors the wide on-screen table: one PO row with repeated
+    // stage groups across the sheet.
+    const collapseStageLines = !!(data && data.filters && data.filters.collapseStageLines);
+    const rows = buildExcelWideRows(data.rows || [], collapseStageLines);
+    const maxStageCount = Math.max(1, rows.reduce((max, row) => Math.max(max, row.stages.length), 0));
     const headers = [
       'PO #',
       'Vendor',
-      'PO Date',
+      'Created Date',
       'PR Submission Date',
       'Procurement Approval Date',
       'PO Order Date',
       'Requestor',
-      'Amount',
+      'Amount'
+    ];
+    for (let i = 0; i < maxStageCount; i++) {
+      headers.push.apply(headers, buildExcelStageGroupHeaders(i));
+    }
+
+    const body = rows.map((row, idx) => {
+      // Cell objects can carry Excel CSS classes, while plain values use the
+      // default text cell behavior.
+      const cells = [
+        { value: row.poNumber, className: 'po-number' },
+        row.vendor,
+        { value: row.createdDate, className: 'datetime' },
+        { value: row.prSubmissionDate, className: 'datetime' },
+        { value: row.procurementApprovalDate, className: 'datetime' },
+        { value: row.poOrderDate, className: 'datetime' },
+        row.requestor,
+        { value: row.amount, className: 'number' }
+      ];
+
+      for (let i = 0; i < maxStageCount; i++) {
+        const stage = row.stages[i];
+        cells.push(
+          stage ? stage.stageNumber : '',
+          stage ? stage.approver : '',
+          { value: stage ? stage.stageStart : '', className: 'datetime' },
+          { value: stage ? stage.stageEnd : '', className: 'datetime' },
+          { value: stage ? stage.businessTime : '', className: 'time-text' },
+          { value: stage ? stage.calendarTime : '', className: 'time-text' }
+        );
+      }
+
+      return '<tr class="tone-' + escAttr(String(idx % 8)) + '">' + cells.map(buildExcelHtmlCell).join('') + '</tr>';
+    }).join('');
+
+    return '<table class="timeline">' + buildExcelColumnGroup(maxStageCount) + '<thead><tr>' + headers.map(header => '<th>' + esc(header) + '</th>').join('') + '</tr></thead><tbody>' + body + '</tbody></table>';
+  }
+
+  function buildExcelWideRows(rows, collapseStageLines) {
+    // Convert summary rows into a display-only shape before writing Excel markup.
+    return (rows || []).map(row => {
+      const stages = buildDisplayStages(row).filter(stage => !shouldHideCollapsedDisplayStage(stage, collapseStageLines));
+
+      return {
+        poNumber: row.tranId || row.internalId || '',
+        vendor: row.vendor || '',
+        createdDate: row.createdDate || '',
+        prSubmissionDate: formatPrSubmissionDate(row),
+        procurementApprovalDate: formatProcurementApprovalDate(row),
+        poOrderDate: formatPoOrderDate(row),
+        requestor: row.requestor || 'Unknown',
+        amount: row.amount || 0,
+        stages: stages.map(stage => ({
+          stageNumber: formatStageNumber(stage.displaySeq || stage.seq || ''),
+          approver: stage.approverText || '',
+          stageStart: formatDateTimeText(stage.start, stage.startText),
+          stageEnd: formatDateTimeText(stage.end, stage.endText),
+          businessTime: formatMinutes(stage.businessMins),
+          calendarTime: formatMinutes(stage.calendarMins)
+        }))
+      };
+    });
+  }
+
+  function buildExcelColumnGroup(stageCount) {
+    // Match Excel column widths to the on-screen wide table as closely as HTML
+    // table rendering allows.
+    const widths = [95, 200, 165, 165, 205, 165, 150, 95];
+    for (let i = 0; i < stageCount; i++) {
+      widths.push(100, 165, 155, 155, 120, 120);
+    }
+
+    return '<colgroup>' + widths.map(width => '<col style="width:' + escAttr(String(width)) + 'px" />').join('') + '</colgroup>';
+  }
+
+  function buildExcelStageGroupHeaders(stageIndex) {
+    return [
       'Stage #',
-      'Approver',
+      Number(stageIndex || 0) === 0 ? 'Creator' : 'Approver',
       'Stage Start',
       'Stage End',
       'Business Time',
       'Calendar Time'
     ];
-
-    const body = rows.map(row => {
-      const cells = [
-        row.poNumber,
-        row.vendor,
-        row.poDate,
-        row.prSubmissionDate,
-        row.procurementApprovalDate,
-        row.poOrderDate,
-        row.requestor,
-        { value: row.amount, className: 'number' },
-        row.stageNumber,
-        row.approver,
-        row.stageStart,
-        row.stageEnd,
-        row.businessTime,
-        row.calendarTime
-      ];
-
-      return '<tr>' + cells.map(buildExcelHtmlCell).join('') + '</tr>';
-    }).join('');
-
-    return '<table><thead><tr>' + headers.map(header => '<th>' + esc(header) + '</th>').join('') + '</tr></thead><tbody>' + body + '</tbody></table>';
   }
 
   function buildExcelHtmlCell(cell) {
+    // Accept either primitive values or { value, className } descriptors.
     const cellObj = (cell && typeof cell === 'object' && Object.prototype.hasOwnProperty.call(cell, 'value')) ? cell : { value: cell };
     const classAttr = cellObj.className ? ' class="' + escAttr(cellObj.className) + '"' : '';
     return '<td' + classAttr + '>' + esc(cellObj.value) + '</td>';
   }
 
   function buildCsvStageRow(row, stage, isPoStart) {
+    // isPoStart is retained for compatibility with prior row-builder signatures;
+    // the CSV now repeats PO fields on every row for easier filtering.
     return [
       row.tranId,
       row.internalId,
       row.vendor,
-      row.tranDate,
+      row.createdDate,
       formatPrSubmissionDate(row),
       formatProcurementApprovalDate(row),
       formatPoOrderDate(row),
@@ -2735,6 +3222,8 @@ define([
   }
 
   function writeErrorPage(response, e) {
+    // Render errors inside a normal NetSuite form so users can capture the failure
+    // message and support can still identify the Suitelet.
     const form = serverWidget.createForm({ title: CONFIG.title });
     const html = form.addField({
       id: 'custpage_error',
@@ -2750,6 +3239,8 @@ define([
   }
 
   function normalizeFilters(params) {
+    // Accept both NetSuite field IDs and shorter alias params so links/tests can
+    // call the Suitelet without duplicating UI field names.
     const defaults = getDefaultDateRange();
     const dateFrom = stripTime(parseDateParam(params.custpage_datefrom || params.dateFrom || params.from) || defaults.dateFrom);
     const dateTo = stripTime(parseDateParam(params.custpage_dateto || params.dateTo || params.to) || defaults.dateTo);
@@ -2757,6 +3248,8 @@ define([
       ? { dateFrom: dateFrom, dateTo: dateTo }
       : { dateFrom: dateTo, dateTo: dateFrom };
 
+    // Swap reversed dates instead of erroring; this keeps accidental date entry
+    // mistakes from breaking the report.
     return {
       dateFrom: normalized.dateFrom,
       dateTo: normalized.dateTo,
@@ -2770,6 +3263,8 @@ define([
   }
 
   function getDefaultDateRange() {
+    // Default window is inclusive from today minus CONFIG.defaultDaysBack through
+    // today, with times stripped for stable NetSuite date filters.
     const today = stripTime(new Date());
     return {
       dateFrom: addDays(today, -CONFIG.defaultDaysBack),
@@ -2782,6 +3277,8 @@ define([
     if (!needle) return rows;
 
     return rows.filter(row => {
+      // Search the enriched row, not just transaction fields, so fallback approver
+      // names and workflow milestone text are searchable.
       const parts = [
         row.tranId,
         row.vendor,
@@ -2800,11 +3297,14 @@ define([
   }
 
   function shouldApplyTranIdSearch(searchText) {
+    // Only apply a transaction search filter for PO-like values. Broad free-text
+    // search remains a post-load filter.
     const text = clean(searchText).toUpperCase().replace(/\s+/g, '');
     return /^P[OR][0-9]{3,}$/.test(text) || /^[0-9]{4,}$/.test(text);
   }
 
   function isRelevantSystemNoteField(fieldName) {
+    // System Notes fallback only needs fields that can start/end approval stages.
     const normalized = normalizeFieldName(fieldName);
     return isDocStatusField(normalized) ||
       isNextApproverField(normalized) ||
@@ -2812,6 +3312,7 @@ define([
   }
 
   function isDocStatusField(normalizedField) {
+    // Document status fields close final stages when approval completes.
     return normalizedField === 'documentstatus' ||
       normalizedField === 'approvalstatus' ||
       normalizedField === 'orderstatus' ||
@@ -2819,6 +3320,7 @@ define([
   }
 
   function isNextApproverField(normalizedField) {
+    // Avoid treating next approver role as the approver person field.
     if (isNextApproverRoleField(normalizedField)) return false;
     return normalizedField === 'nextapprover' ||
       normalizedField === 'custbodynextapprover' ||
@@ -2826,12 +3328,15 @@ define([
   }
 
   function isNextApproverRoleField(normalizedField) {
+    // Role fields describe the approver stage but do not identify the employee.
     return normalizedField === 'nextapproverrole' ||
       normalizedField === 'custbodynextapproverrole' ||
       normalizedField.indexOf('nextapproverrole') >= 0;
   }
 
   function collectSystemNoteApproverIds(eventsByPo) {
+    // Collect employee internal IDs from System Notes so fallback stages can show
+    // names instead of numeric IDs.
     const seen = {};
     const ids = [];
 
@@ -2851,6 +3356,8 @@ define([
   }
 
   function getEmployeeNameMap(employeeIds) {
+    // Resolve employee display names in one search rather than one lookup per
+    // System Note event.
     const ids = uniqueTruthy(employeeIds);
     const map = {};
     if (!ids.length) return map;
@@ -2887,6 +3394,7 @@ define([
   }
 
   function resolveSystemNoteApproverName(rawValue, employeeMap) {
+    // System Notes may store either an employee ID or already-readable text.
     const rawText = normalizeApproverDisplay(rawValue);
     if (!rawText) return '';
 
@@ -2896,11 +3404,13 @@ define([
   }
 
   function normalizeEmployeeId(value) {
+    // Employee IDs are numeric in System Notes. Anything else is treated as text.
     const text = clean(value);
     return /^\d+$/.test(text) ? text : '';
   }
 
   function normalizeApproverDisplay(value) {
+    // NetSuite sometimes represents empty list values as -1/none/null text.
     const text = clean(value);
     const normalized = text.toLowerCase();
 
@@ -2912,14 +3422,17 @@ define([
   }
 
   function normalizeApproverKey(value) {
+    // Lowercased approver key for duplicate/coverage comparisons.
     return normalizeApproverDisplay(value).toLowerCase();
   }
 
   function sameCleanText(a, b) {
+    // Case-insensitive comparison after the same cleanup path used everywhere else.
     return clean(a).toLowerCase() === clean(b).toLowerCase();
   }
 
   function getSearchableTransactionColumnIds(fieldIds) {
+    // Drop unavailable field IDs before building transaction searches.
     return uniqueTruthy(fieldIds).filter(fieldId => hasTransactionColumn(fieldId));
   }
 
@@ -2933,6 +3446,8 @@ define([
 
     let exists = false;
     try {
+      // No-result search acts as a schema/permission probe for the candidate
+      // transaction column.
       search.create({
         type: search.Type.TRANSACTION,
         filters: [['internalid', 'anyof', '@NONE@']],
@@ -2948,18 +3463,20 @@ define([
   }
 
   function readFirstResultColumnText(result, fieldIds) {
+    // Try each candidate field in priority order and return the first non-empty
+    // display text or raw value.
     for (let i = 0; i < fieldIds.length; i++) {
       const fieldId = fieldIds[i];
       let value = '';
 
       try {
         value = result.getText({ name: fieldId }) || '';
-      } catch (e) {}
+      } catch (e) { }
 
       if (!value) {
         try {
           value = result.getValue({ name: fieldId }) || '';
-        } catch (e) {}
+        } catch (e) { }
       }
 
       value = clean(value);
@@ -2970,6 +3487,8 @@ define([
   }
 
   function chooseEarliestDateTimeText(values) {
+    // Some accounts have multiple creation-related fields. Choose the earliest
+    // parseable timestamp, with a text fallback if parsing fails.
     let earliestDate = null;
     let earliestText = '';
     let fallbackText = '';
@@ -2992,6 +3511,8 @@ define([
   }
 
   function getLoadableOptionalFields() {
+    // Cache optional child-record field availability before building persisted
+    // stage searches.
     return {
       approverText: hasOptionalField(ANALYTICS_FIELDS.APPROVER_TEXT),
       transitionType: hasOptionalField(ANALYTICS_FIELDS.TRANSITION_TYPE),
@@ -3008,6 +3529,8 @@ define([
 
     let exists = false;
     try {
+      // Same no-result search strategy used for transaction fields, but against
+      // the child approval-stage record.
       search.create({
         type: CONFIG.childRecordType,
         filters: [['internalid', 'anyof', '@NONE@']],
@@ -3023,6 +3546,8 @@ define([
   }
 
   function runPaged(nsSearch, eachResult) {
+    // Standard helper for reading all result pages while keeping page size at the
+    // NetSuite maximum.
     const paged = nsSearch.runPaged({ pageSize: 1000 });
     paged.pageRanges.forEach(pageRange => {
       const page = paged.fetch({ index: pageRange.index });
@@ -3031,6 +3556,8 @@ define([
   }
 
   function resolvePurchaseOrderUrl(poId) {
+    // Resolve a view-mode URL when possible; missing permissions or invalid IDs
+    // simply omit the hyperlink.
     try {
       return url.resolveRecord({
         recordType: record.Type.PURCHASE_ORDER,
@@ -3043,6 +3570,8 @@ define([
   }
 
   function isApprovedStatus(statusText) {
+    // Treat post-approval PO statuses as approved because NetSuite moves approved
+    // POs into receipt/billing states.
     const s = clean(statusText).toLowerCase();
     return s.indexOf('approved') >= 0 ||
       s.indexOf('pending receipt') >= 0 ||
@@ -3052,6 +3581,8 @@ define([
   }
 
   function isPendingApprovalStatus(approvalStatusText, transactionStatusText) {
+    // Approval status and transaction status can carry pending text depending on
+    // the account/workflow configuration.
     const approval = clean(approvalStatusText).toLowerCase();
     const transaction = clean(transactionStatusText).toLowerCase();
     return approval.indexOf('pending approval') >= 0 ||
@@ -3060,6 +3591,8 @@ define([
   }
 
   function isTerminalTransactionStatus(statusText) {
+    // Terminal here means the PO should not be represented as an active current
+    // approver fallback.
     const s = clean(statusText).toLowerCase();
     if (!s) return false;
 
@@ -3075,6 +3608,7 @@ define([
   }
 
   function parseDateParam(value) {
+    // DATE parser for form filters and transaction dates.
     if (Object.prototype.toString.call(value) === '[object Date]') {
       return isNaN(value.getTime()) ? null : value;
     }
@@ -3083,18 +3617,22 @@ define([
     if (!text) return null;
 
     try {
+      // Use NetSuite's parser first to honor user/account date preferences.
       const parsed = format.parse({
         value: text,
         type: format.Type.DATE
       });
       if (parsed && !isNaN(parsed.getTime())) return parsed;
-    } catch (e) {}
+    } catch (e) { }
 
+    // Native Date is a final fallback for test inputs or ISO-like strings.
     const nativeDate = new Date(text);
     return isNaN(nativeDate.getTime()) ? null : nativeDate;
   }
 
   function parseNsDateTime(value) {
+    // DATETIMETZ is preferred for workflow/system note timestamps; DATETIME and
+    // DATE parsing provide fallbacks for fields without timezone text.
     if (Object.prototype.toString.call(value) === '[object Date]') {
       return isNaN(value.getTime()) ? null : value;
     }
@@ -3108,7 +3646,7 @@ define([
         type: format.Type.DATETIMETZ
       });
       if (parsedTz && !isNaN(parsedTz.getTime())) return parsedTz;
-    } catch (e) {}
+    } catch (e) { }
 
     try {
       const parsedDateTime = format.parse({
@@ -3116,12 +3654,13 @@ define([
         type: format.Type.DATETIME
       });
       if (parsedDateTime && !isNaN(parsedDateTime.getTime())) return parsedDateTime;
-    } catch (e) {}
+    } catch (e) { }
 
     return parseDateParam(text);
   }
 
   function formatDate(dateObj) {
+    // Format through NetSuite so the Suitelet respects account/user date settings.
     return format.format({
       value: dateObj,
       type: format.Type.DATE
@@ -3129,6 +3668,8 @@ define([
   }
 
   function formatDateTimeText(dateObj, fallbackText) {
+    // Use fallback text when formatting is impossible so the UI does not lose a
+    // source timestamp that was already readable.
     const fallback = clean(fallbackText);
     if (!dateObj) return fallback || '-';
 
@@ -3143,6 +3684,7 @@ define([
   }
 
   function formatCurrency(value) {
+    // Render amount without a currency symbol so the caller can decide prefixing.
     const num = toNumber(value);
     return num.toLocaleString(undefined, {
       minimumFractionDigits: 2,
@@ -3151,6 +3693,7 @@ define([
   }
 
   function formatMinutes(totalMinutes) {
+    // Human-readable duration used consistently in dashboard, CSV, and Excel.
     totalMinutes = Math.max(0, Math.round(Number(totalMinutes || 0)));
     const days = Math.floor(totalMinutes / 1440);
     const hours = Math.floor((totalMinutes % 1440) / 60);
@@ -3162,6 +3705,7 @@ define([
   }
 
   function diffMinutes(start, end) {
+    // Negative or incomplete intervals are clamped to zero.
     const startDate = toDate(start);
     const endDate = toDate(end);
 
@@ -3170,6 +3714,7 @@ define([
   }
 
   function businessMinutesBetween(start, end) {
+    // Count only Monday-Friday time inside the configured working day window.
     const startDate = toDate(start);
     const endDate = toDate(end);
 
@@ -3183,6 +3728,7 @@ define([
       const day = cursor.getDay();
 
       if (day >= 1 && day <= 5) {
+        // Clip the requested interval to the workday bounds for each weekday.
         const workStart = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), CONFIG.workdayStartHour, 0, 0, 0);
         const workEnd = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), CONFIG.workdayEndHour, 0, 0, 0);
         const rangeStart = maxDate(startDate, workStart);
@@ -3200,6 +3746,7 @@ define([
   }
 
   function toCsvRow(row) {
+    // Quote every CSV cell; this handles commas, quotes, and line breaks safely.
     return row.map(cell => {
       const value = clean(cell);
       return '"' + value.replace(/"/g, '""') + '"';
@@ -3207,16 +3754,19 @@ define([
   }
 
   function toNumber(value) {
+    // Normalize NetSuite number strings that may include thousands separators.
     const number = Number((clean(value) || '0').replace(/,/g, ''));
     return isNaN(number) ? 0 : number;
   }
 
   function toInteger(value) {
+    // Strict base-10 parsing for page indexes and similar request params.
     const number = parseInt(clean(value) || '0', 10);
     return isNaN(number) ? 0 : number;
   }
 
   function toDate(value) {
+    // Convert native Date or date-like text into a valid Date object.
     if (Object.prototype.toString.call(value) === '[object Date]') {
       return isNaN(value.getTime()) ? null : value;
     }
@@ -3237,18 +3787,21 @@ define([
   }
 
   function stripTime(value) {
+    // Date filters should start at midnight to avoid time-of-day surprises.
     const d = new Date(value.getTime());
     d.setHours(0, 0, 0, 0);
     return d;
   }
 
   function addDays(dateObj, days) {
+    // Clone before mutating so callers do not accidentally shift their input date.
     const d = new Date(dateObj.getTime());
     d.setDate(d.getDate() + Number(days || 0));
     return d;
   }
 
   function chunkArray(values, size) {
+    // General helper for keeping search filters under practical NetSuite limits.
     const chunks = [];
     for (let i = 0; i < values.length; i += size) {
       chunks.push(values.slice(i, i + size));
@@ -3257,6 +3810,8 @@ define([
   }
 
   function uniqueTruthy(values) {
+    // Deduplicate after clean() so whitespace-only and null-like adapter values
+    // are discarded consistently.
     const seen = {};
     const out = [];
 
@@ -3271,20 +3826,24 @@ define([
   }
 
   function extractApproverFromName(name) {
+    // Persisted child record names may include prefix pieces before the approver.
     const parts = clean(name).split(' - ');
     return parts.length >= 3 ? parts.slice(2).join(' - ') : '';
   }
 
   function normalizeFieldName(value) {
+    // Collapse labels/internal IDs into a comparison-safe lowercase token.
     return clean(value).toLowerCase().replace(/[^a-z0-9]/g, '');
   }
 
   function toBool(value) {
+    // Accept NetSuite checkbox values plus common URL/test boolean aliases.
     const text = clean(value).toUpperCase();
     return value === true || text === 'T' || text === 'TRUE' || text === 'Y' || text === 'YES' || text === '1';
   }
 
   function describeError(e) {
+    // Normalize NetSuite adapter errors into support-readable text.
     const name = clean(e && e.name) || 'Error';
     const message = clean(e && e.message) || clean(e);
 
@@ -3296,6 +3855,8 @@ define([
   }
 
   function logWorkflowHistoryFallbackFailure(title, e, poId) {
+    // Workflow-locked records are expected for active approvals, so log them at
+    // debug level instead of error level.
     const details = (poId ? 'PO internal ID ' + poId + ': ' : '') + describeError(e);
 
     if (isRecordLockedByWorkflowError(e)) {
@@ -3313,6 +3874,7 @@ define([
   }
 
   function isRecordLockedByWorkflowError(e) {
+    // Detect the common NetSuite workflow lock message from name/message/string.
     const text = (
       clean(e && e.name) + ' ' +
       clean(e && e.message) + ' ' +
@@ -3324,6 +3886,7 @@ define([
   }
 
   function clean(value) {
+    // One cleanup path for user input, NetSuite search values, and adapter objects.
     if (isNullAdapterValue(value)) return '';
 
     let text = '';
@@ -3337,10 +3900,13 @@ define([
   }
 
   function isEmptyValue(value) {
+    // Empty includes NetSuite adapter nulls, not just JavaScript null/empty string.
     return value === '' || value == null || isNullAdapterValue(value) || clean(value) === '';
   }
 
   function isNullAdapterValue(value) {
+    // NetSuite sometimes returns Java adapter placeholders that stringify poorly
+    // and should be treated as empty values.
     if (value == null) return true;
     if (Object.prototype.toString.call(value) === '[object Date]') return false;
 
@@ -3355,11 +3921,13 @@ define([
   }
 
   function isNullAdapterText(text) {
+    // Known placeholder text emitted by NetSuite's script object adapters.
     return String(text || '').indexOf('ScriptNullObjectAdapter') >= 0 ||
       String(text || '').indexOf('com.netsuite.suitescript.scriptobject') >= 0;
   }
 
   function esc(value) {
+    // Escape text inserted into inline HTML.
     if (isNullAdapterValue(value)) return '';
     return String(value == null ? '' : value)
       .replace(/&/g, '&amp;')
@@ -3370,6 +3938,7 @@ define([
   }
 
   function escAttr(value) {
+    // Attribute escaping adds backtick handling on top of standard HTML escaping.
     return esc(value).replace(/`/g, '&#96;');
   }
 

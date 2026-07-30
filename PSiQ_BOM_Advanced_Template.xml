@@ -1,0 +1,289 @@
+<?xml version="1.0"?>
+<!DOCTYPE pdf PUBLIC "-//big.faceless.org//report" "report-1.1.dtd">
+<pdf>
+<head>
+    <link name="NotoSans" type="font" subtype="truetype"
+        src="${nsfont.NotoSans_Regular}"
+        src-bold="${nsfont.NotoSans_Bold}"
+        src-italic="${nsfont.NotoSans_Italic}"
+        src-bolditalic="${nsfont.NotoSans_BoldItalic}"
+        bytes="2" />
+    <macrolist>
+        <macro id="nlheader">
+            <table class="header" style="width: 100%;">
+                <tr>
+                    <td rowspan="3" valign="middle"
+                        style="width: 58%; vertical-align: middle;">
+                        <#if companyInformation.logoUrl?has_content>
+                            <@filecabinet nstype="image"
+                                style="width: 42px; height: 42px;
+                                    vertical-align: middle; margin: 2px 0;"
+                                src="${companyInformation.logoUrl}" />
+                        </#if>
+                    </td>
+                    <td colspan="2" align="right"
+                        class="header-title-cell">
+                        <span class="title">Bill Of Materials</span>
+                    </td>
+                </tr>
+                <tr>
+                    <td class="header-meta header-meta-label"
+                        align="right"><b>Date</b></td>
+                    <td class="header-meta header-meta-value"
+                        align="right">
+                        ${record.trandate}
+                    </td>
+                </tr>
+                <tr>
+                    <td class="header-meta header-meta-label"
+                        align="right"><b>Order #</b></td>
+                    <td class="header-meta header-meta-value"
+                        align="right">
+                        ${record.tranid}
+                    </td>
+                </tr>
+            </table>
+        </macro>
+        <macro id="nlfooter">
+            <table class="footer" style="width: 100%;">
+                <tr>
+                    <td>
+                        <barcode codetype="code128"
+                            showtext="true"
+                            value="${record.tranid}" />
+                    </td>
+                    <td align="center">
+                        <#if bom??>
+                            Printed ${bom.printedAt} by ${bom.printedBy}
+                        </#if>
+                    </td>
+                    <td align="right">
+                        <pagenumber /> of <totalpages />
+                    </td>
+                </tr>
+            </table>
+        </macro>
+    </macrolist>
+    <style>
+        * {
+            font-family: NotoSans, sans-serif;
+        }
+        table {
+            font-size: 8pt;
+            table-layout: fixed;
+        }
+        th {
+            font-weight: bold;
+            font-size: 8pt;
+            vertical-align: middle;
+            padding: 5px 4px 3px;
+            background-color: #e3e3e3;
+            color: #333333;
+        }
+        td {
+            padding: 3px 4px;
+            vertical-align: top;
+        }
+        b {
+            font-weight: bold;
+            color: #333333;
+        }
+        table.header td {
+            padding: 0 3px;
+            font-size: 9pt;
+        }
+        table.header td.header-meta {
+            padding-top: 2px;
+            line-height: 115%;
+        }
+        table.header td.header-meta-label {
+            width: 27%;
+            padding-right: 8px;
+        }
+        table.header td.header-meta-value {
+            width: 15%;
+        }
+        table.header td.header-title-cell {
+            padding-bottom: 6px;
+            text-align: right;
+        }
+        table.footer td {
+            padding: 0;
+            font-size: 8pt;
+        }
+        table.itemtable th {
+            padding-bottom: 7px;
+            padding-top: 7px;
+        }
+        table.itemtable td {
+            border-bottom: 0.4pt solid #dddddd;
+        }
+        table.itemtable tr.item-row {
+            page-break-inside: avoid;
+        }
+        table.details td {
+            padding: 2px 4px;
+        }
+        td.detail-label {
+            width: 20%;
+            font-family: NotoSans, sans-serif;
+            font-size: 8pt;
+            font-weight: bold;
+            color: #333333;
+            text-align: left;
+            white-space: nowrap;
+        }
+        td.detail-value {
+            width: 42%;
+            text-align: left;
+        }
+        td.detail-label-right {
+            width: 20%;
+            font-family: NotoSans, sans-serif;
+            font-size: 8pt;
+            font-weight: bold;
+            color: #333333;
+            text-align: right;
+            white-space: nowrap;
+            padding-right: 10px;
+        }
+        td.detail-value-right {
+            width: 18%;
+            text-align: left;
+        }
+        span.title {
+            font-size: 20pt;
+            font-weight: bold;
+        }
+        span.itemname {
+            font-weight: bold;
+        }
+        span.bin-quantity {
+            color: #555555;
+        }
+    </style>
+</head>
+<body header="nlheader" header-height="12%"
+    footer="nlfooter" footer-height="18pt"
+    padding="0.5in 0.5in 0.5in 0.5in" size="Letter">
+
+    <#if bom??>
+        <table class="details" style="width: 100%; margin-top: 8px;">
+            <tr>
+                <td class="detail-label">Assembly</td>
+                <td class="detail-value">${record.assemblyitem}</td>
+                <td class="detail-label-right" align="right">
+                    Qty.&#160;Required
+                </td>
+                <td class="detail-value-right">
+                    ${record.quantity} ${record.units}
+                </td>
+            </tr>
+            <#if bom.header.assemblyDescription?has_content>
+                <tr>
+                    <td class="detail-label" align="left">
+                        Assembly&#160;Description
+                    </td>
+                    <td colspan="3">${bom.header.assemblyDescription}</td>
+                </tr>
+            </#if>
+            <#if bom.header.status?has_content || bom.header.location?has_content>
+                <tr>
+                    <#if bom.header.status?has_content>
+                        <td class="detail-label">Status</td>
+                        <td class="detail-value">${bom.header.status}</td>
+                    <#else>
+                        <td></td><td></td>
+                    </#if>
+                    <#if bom.header.location?has_content>
+                        <td class="detail-label-right" align="right">
+                            Location
+                        </td>
+                        <td class="detail-value-right">
+                            ${bom.header.location}
+                        </td>
+                    <#else>
+                        <td></td><td></td>
+                    </#if>
+                </tr>
+            </#if>
+            <#if bom.header.subsidiary?has_content>
+                <tr>
+                    <td class="detail-label">Subsidiary</td>
+                    <td colspan="3">${bom.header.subsidiary}</td>
+                </tr>
+            </#if>
+            <#if bom.header.className?has_content || bom.header.customer?has_content>
+                <tr>
+                    <#if bom.header.className?has_content>
+                        <td class="detail-label">Class</td>
+                        <td class="detail-value">${bom.header.className}</td>
+                    <#else>
+                        <td></td><td></td>
+                    </#if>
+                    <#if bom.header.customer?has_content>
+                        <td class="detail-label-right" align="right">
+                            Customer
+                        </td>
+                        <td class="detail-value-right">
+                            ${bom.header.customer}
+                        </td>
+                    <#else>
+                        <td></td><td></td>
+                    </#if>
+                </tr>
+            </#if>
+            <#if bom.header.revision?has_content>
+                <tr>
+                    <td class="detail-label">Revision</td>
+                    <td colspan="3">${bom.header.revision}</td>
+                </tr>
+            </#if>
+        </table>
+
+        <#if bom.lines?has_content>
+            <table class="itemtable"
+                style="width: 100%; margin-top: 10px;">
+                <thead>
+                    <tr>
+                        <th colspan="2" align="center">Line</th>
+                        <th colspan="4">Item</th>
+                        <th colspan="9">Description</th>
+                        <th colspan="3" align="right">Qty. Required</th>
+                        <th colspan="2">Units</th>
+                        <th colspan="4">Inventory Detail</th>
+                    </tr>
+                </thead>
+                <#list bom.lines as line>
+                    <#if (line_index % 2) == 1>
+                        <tr class="item-row"
+                            style="background-color: #f7f7f7;
+                                page-break-inside: avoid;">
+                    <#else>
+                        <tr class="item-row"
+                            style="page-break-inside: avoid;">
+                    </#if>
+                        <td colspan="2" align="center">
+                            ${line_index + 1}
+                        </td>
+                        <td colspan="4">
+                            <span class="itemname">${line.item}</span>
+                        </td>
+                        <td colspan="9">${line.description}</td>
+                        <td colspan="3" align="right">${line.quantity}</td>
+                        <td colspan="2">${line.units}</td>
+                        <td colspan="4">
+                            <#if line.inventoryDetails?has_content>
+                                <#list line.inventoryDetails as inventory>
+                                    <span>${inventory.bin} (${inventory.quantity})</span>
+                                    <#if inventory_has_next><br /></#if>
+                                </#list>
+                            </#if>
+                        </td>
+                    </tr>
+                </#list>
+            </table>
+        </#if>
+    </#if>
+</body>
+</pdf>
